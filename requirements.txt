@@ -1,0 +1,16 @@
+# Core Dependencies for Multimodal Real-Time AI Desktop Assistant
+mss>=10.0.0
+Pillow>=10.0.0
+numpy>=1.26.0
+sounddevice>=0.4.6
+pytesseract>=0.3.10
+winocr>=0.0.15
+anthropic>=0.34.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+pytest>=8.0.0
+
+# Optional / Accelerated STT and VAD
+# faster-whisper>=1.0.0
+# torch>=2.0.0
+# silero-vad>=5.1
