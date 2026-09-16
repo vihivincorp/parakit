@@ -73,6 +73,7 @@ class DesktopOverlay:
         self._build_widgets()
         self._setup_text_tags()
         self._apply_capture_exclusion()
+        self._hide_from_taskbar_and_alt_tab()
         self._start_queue_poller()
 
     def _setup_window(self):
@@ -899,6 +900,29 @@ class DesktopOverlay:
                 logger.info("Overlay window set to WDA_EXCLUDEFROMCAPTURE")
         except Exception as e:
             logger.warning(f"Could not apply display affinity: {e}")
+
+    def _hide_from_taskbar_and_alt_tab(self):
+        """Applies WS_EX_TOOLWINDOW style so the overlay does not appear in the Taskbar or Alt+Tab switcher."""
+        if sys.platform != "win32":
+            return
+        try:
+            self.root.update_idletasks()
+            hwnd = self.root.winfo_id()
+            GA_ROOT = 2
+            user32 = ctypes.windll.user32
+            top_hwnd = user32.GetAncestor(hwnd, GA_ROOT)
+            target = top_hwnd if top_hwnd else hwnd
+
+            GWL_EXSTYLE = -20
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_APPWINDOW = 0x00040000
+
+            style = user32.GetWindowLongW(target, GWL_EXSTYLE)
+            new_style = (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+            user32.SetWindowLongW(target, GWL_EXSTYLE, new_style)
+            logger.info(f"Overlay hidden from Windows Taskbar & Alt+Tab switcher (HWND: {target})")
+        except Exception as e:
+            logger.debug(f"Could not apply WS_EX_TOOLWINDOW: {e}")
 
     # Thread-Safe UI Updates via Message Queue
     def post_update(self, msg_type: str, data: dict):
