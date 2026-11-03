@@ -91,15 +91,23 @@ class AudioCapture:
             else:
                 mono = raw
 
-            # Clean linear interpolation resampling to exact sample_rate (e.g. 16000 Hz)
+            # Clean anti-aliasing resampling to exact sample_rate (e.g. 16000 Hz)
             if self._lb_rate != self.sample_rate and len(mono) > 0:
-                target_len = int(round(len(mono) * (self.sample_rate / self._lb_rate)))
-                if target_len > 0:
-                    orig_indices = np.linspace(0.0, 1.0, len(mono), endpoint=False)
-                    target_indices = np.linspace(0.0, 1.0, target_len, endpoint=False)
-                    resampled = np.interp(target_indices, orig_indices, mono).astype(np.float32)
+                # Fast anti-aliasing 3:1 decimation filter for 48kHz -> 16kHz
+                if self._lb_rate == 48000 and self.sample_rate == 16000:
+                    usable_len = (len(mono) // 3) * 3
+                    if usable_len > 0:
+                        resampled = mono[:usable_len].reshape(-1, 3).mean(axis=1).astype(np.float32)
+                    else:
+                        resampled = np.array([], dtype=np.float32)
                 else:
-                    resampled = np.array([], dtype=np.float32)
+                    target_len = int(round(len(mono) * (self.sample_rate / self._lb_rate)))
+                    if target_len > 0:
+                        orig_indices = np.linspace(0.0, 1.0, len(mono), endpoint=False)
+                        target_indices = np.linspace(0.0, 1.0, target_len, endpoint=False)
+                        resampled = np.interp(target_indices, orig_indices, mono).astype(np.float32)
+                    else:
+                        resampled = np.array([], dtype=np.float32)
             else:
                 resampled = mono.astype(np.float32)
 

@@ -33,10 +33,16 @@ class VoiceActivityDetector:
     def __init__(
         self,
         energy_threshold: float = 0.005,
-        silence_timeout_sec: float = 0.80,
+        silence_timeout_sec: Optional[float] = None,
         min_speech_duration_sec: float = 0.35,
         pre_speech_chunks: int = 4
     ):
+        import os
+        if silence_timeout_sec is None:
+            try:
+                silence_timeout_sec = float(os.getenv("VAD_SILENCE_TIMEOUT", "0.55"))
+            except (ValueError, TypeError):
+                silence_timeout_sec = 0.55
         self.energy_threshold = energy_threshold
         self.silence_timeout_sec = silence_timeout_sec
         self.min_speech_duration_sec = min_speech_duration_sec

@@ -4,6 +4,7 @@ Optimized for ultra-fast response latency (~250ms), high accuracy, and zero hall
 """
 
 from dataclasses import dataclass
+import os
 import re
 import time
 import threading
@@ -48,7 +49,7 @@ class SpeechToText:
         task: str = "transcribe",
         language: str = "en",
         beam_size: int = 3,
-        initial_prompt: Optional[str] = "Technical interview conversation between candidate and interviewer. Questions regarding projects, experience, resume, system design, explain your project, how it operates, coding problems, algorithms, bug fixes, architecture, HireMatrix, Python, Neo4j, FastAPI.",
+        initial_prompt: Optional[str] = "Python, JavaScript, TypeScript, FastAPI, React, SQL, algorithms, data structures, system design, LeetCode, HireMatrix, AWS, Docker, Kubernetes.",
         gnani_api_key: Optional[str] = None,
         gnani_language_code: str = "en-IN"
     ):
@@ -82,14 +83,44 @@ class SpeechToText:
             else:
                 logger.warning("Gnani engine requested but GNANI_API_KEY is not set. Falling back to local faster-whisper.")
 
+        # Groq Whisper Cloud Engine (Ultra-low latency ~150ms with whisper-large-v3-turbo)
+        groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
+        if self.engine_name == "groq" or (groq_api_key and self.engine_name == "auto"):
+            if groq_api_key:
+                try:
+                    import openai
+                    self._groq_client = openai.OpenAI(
+                        base_url="https://api.groq.com/openai/v1",
+                        api_key=groq_api_key,
+                        timeout=10.0
+                    )
+                    self.engine_name = "groq"
+                    logger.info("Real-Time Speech-to-Text active via Groq Cloud (whisper-large-v3-turbo, ~150ms latency).")
+                    return
+                except Exception as e:
+                    logger.warning(f"Could not initialize Groq STT client: {e}")
+
+        # Google SpeechRecognition Engine (Zero setup, high-accuracy cloud STT)
+        if self.engine_name in ("google", "speech_recognition", "speechrecognition"):
+            try:
+                import speech_recognition as sr
+                self._sr_recognizer = sr.Recognizer()
+                self._sr_recognizer.energy_threshold = 200
+                self._sr_recognizer.dynamic_energy_threshold = True
+                self._sr_recognizer.pause_threshold = 0.8
+                self._sr_recognizer.non_speaking_duration = 0.3
+                self.engine_name = "speech_recognition"
+                logger.info("Real-Time Speech-to-Text initialized via Google SpeechRecognition engine.")
+                return
+            except ImportError:
+                logger.warning("speech_recognition library not available.")
+
+        # Local faster-whisper Engine (Offline, local inference)
         if self.engine_name in ("faster-whisper", "auto"):
             try:
                 from faster_whisper import WhisperModel
                 size = self.model_size if self.model_size else "base"
-                # If tiny.en or base.en is passed, normalize to base which is locally cached
-                if size in ("tiny.en", "base.en"):
-                    size = "base"
-                logger.info(f"Loading local high-accuracy faster-whisper model ({size})...")
+                logger.info(f"Loading local faster-whisper model ({size})...")
                 self._model = WhisperModel(size, device="cpu", compute_type="int8")
                 self.engine_name = "faster-whisper"
                 logger.info(f"Local faster-whisper ({size}) initialized - high-accuracy speech recognition active.")
@@ -97,7 +128,7 @@ class SpeechToText:
             except Exception as e:
                 logger.warning(f"Could not load faster-whisper model '{self.model_size}': {e}. Falling back to SpeechRecognition.")
 
-        # SpeechRecognition (Google STT)
+        # SpeechRecognition (Google STT) fallback
         try:
             import speech_recognition as sr
             self._sr_recognizer = sr.Recognizer()
@@ -129,7 +160,7 @@ class SpeechToText:
 
         # Energy gate: check peak amplitude to prevent transcribing microscopic room noise
         peak_amp = float(np.max(np.abs(segment.audio)))
-        if peak_amp < 0.012:
+        if peak_amp < 0.005:
             return None
 
         # Normalize audio volume so Whisper receives optimal dynamic range (~ -14 dB to -20 dBFS)
@@ -159,7 +190,7 @@ class SpeechToText:
                     text = " ".join([s.text for s in segments]).strip()
 
             elif self.engine_name == "faster-whisper" and hasattr(self, "_model"):
-                effective_beam = max(3, self.beam_size)
+                effective_beam = max(1, self.beam_size)
                 segments, info = self._model.transcribe(
                     audio_norm,
                     beam_size=effective_beam,
@@ -179,6 +210,27 @@ class SpeechToText:
                 if hasattr(info, 'language_probability') and info.language_probability is not None:
                     confidence = float(info.language_probability)
 
+            elif self.engine_name == "groq" and hasattr(self, "_groq_client"):
+                import io
+                import wave
+                audio_float = np.clip(audio_norm, -1.0, 1.0)
+                pcm_bytes = (audio_float * 32767).astype(np.int16).tobytes()
+                wav_io = io.BytesIO()
+                with wave.open(wav_io, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(16000)
+                    wf.writeframes(pcm_bytes)
+                wav_io.seek(0)
+                wav_io.name = "audio.wav"
+                resp = self._groq_client.audio.transcriptions.create(
+                    model="whisper-large-v3-turbo",
+                    file=wav_io,
+                    response_format="text",
+                    prompt=self.initial_prompt
+                )
+                text = resp.strip() if isinstance(resp, str) else getattr(resp, "text", "").strip()
+
             elif (self.engine_name in ("speech_recognition", "google")) and self._sr_recognizer:
                 import speech_recognition as sr
                 audio_float = np.clip(audio_norm, -1.0, 1.0)
@@ -189,8 +241,11 @@ class SpeechToText:
                     sample_rate=16000,
                     sample_width=2
                 )
+                target_lang = os.getenv("STT_LANGUAGE", self.gnani_language_code or "en-US")
+                if target_lang == "en":
+                    target_lang = "en-US"
                 try:
-                    text = self._sr_recognizer.recognize_google(audio_data, language="en-US").strip()
+                    text = self._sr_recognizer.recognize_google(audio_data, language=target_lang).strip()
                 except sr.UnknownValueError:
                     return None
                 except sr.RequestError as e:

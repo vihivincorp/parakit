@@ -36,13 +36,13 @@ class AudioConfig:
     vad_energy_threshold: float = float(os.getenv("VAD_ENERGY_THRESHOLD", "0.005"))  # Sensitive energy threshold for clear speech capture
     vad_silence_duration_sec: float = float(os.getenv("VAD_SILENCE_SEC", "0.80"))  # 0.8s silence window to prevent cut-off sentences
     stt_model: str = os.getenv("STT_MODEL", "base")  # High-accuracy local int8 Whisper base model (cached locally)
-    stt_engine: str = os.getenv("STT_ENGINE", "faster-whisper")  # 'faster-whisper' or 'google'
+    stt_engine: str = os.getenv("STT_ENGINE", "google")  # 'google' (recommended, ~0.9s), 'faster-whisper', or 'groq'
     stt_task: str = os.getenv("STT_TASK", "transcribe")  # 'transcribe'
     stt_language: str = os.getenv("STT_LANGUAGE", "en")  # 'en'
-    stt_beam_size: int = int(os.getenv("STT_BEAM_SIZE", "3"))  # Beam size 3 for high-accuracy recognition
+    stt_beam_size: int = int(os.getenv("STT_BEAM_SIZE", "1"))  # Beam size 1 for fast inference
     initial_prompt: str = os.getenv(
         "STT_INITIAL_PROMPT",
-        "Technical interview conversation between candidate and interviewer. Questions regarding projects, experience, resume, system design, coding problems, algorithms, bug fixes, architecture, HireMatrix, Python, Neo4j, FastAPI."
+        "Python, JavaScript, TypeScript, FastAPI, React, SQL, algorithms, data structures, system design, LeetCode, HireMatrix, AWS, Docker, Kubernetes."
     )
     gnani_api_key: str = os.getenv("GNANI_API_KEY", "")
     gnani_language_code: str = os.getenv("GNANI_LANGUAGE_CODE", "en-IN")  # 'en-IN', 'indic-auto', 'hi-IN', etc.
