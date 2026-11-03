@@ -350,10 +350,15 @@ class KeyManager:
             if prov in ("openai", "gemini", "google", "openrouter", "groq", "ollama", "local"):
                 import openai
                 base_url = None
+                default_headers = None
                 if prov in ("gemini", "google"):
                     base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
                 elif prov == "openrouter":
                     base_url = "https://openrouter.ai/api/v1"
+                    default_headers = {
+                        "HTTP-Referer": "https://github.com/vihivincorp/parakit",
+                        "X-Title": "Workspace Assistant"
+                    }
                 elif prov == "groq":
                     base_url = "https://api.groq.com/openai/v1"
                 elif prov in ("ollama", "local"):
@@ -362,10 +367,16 @@ class KeyManager:
                 client = openai.OpenAI(
                     api_key=key,
                     base_url=base_url,
-                    timeout=8.0,
+                    default_headers=default_headers,
+                    timeout=15.0,
                     max_retries=0
                 )
                 test_model = model or self.DEFAULT_MODELS.get(prov, "gpt-4o-mini")
+                if prov == "openrouter":
+                    if not test_model or test_model == "gpt-4o-mini":
+                        test_model = "openai/gpt-4o-mini"
+                    elif "/" not in test_model:
+                        test_model = f"openai/{test_model}"
                 if prov in ("gemini", "google"):
                     if not test_model or not test_model.startswith("gemini") or test_model in ("gemini-1.5-flash", "gemini-2.5-flash"):
                         test_model = "gemini-flash-lite-latest"

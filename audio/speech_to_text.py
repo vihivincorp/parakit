@@ -59,7 +59,7 @@ class SpeechToText:
         self.language = "en" if (not language or language.lower() in ("auto", "none")) else language
         self.beam_size = beam_size
         self.initial_prompt = initial_prompt
-        self.gnani_api_key = (gnani_api_key or os.getenv("GNANI_API_KEY", "")).strip()
+        self.gnani_api_key = (gnani_api_key or os.getenv("GNANI_API_KEY", "")).strip(" '\"*-\r\n\t")
         self.gnani_language_code = gnani_language_code or os.getenv("GNANI_LANGUAGE_CODE", "en-IN")
         self._sr_recognizer = None
         self._transcribe_lock = threading.Lock()

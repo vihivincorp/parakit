@@ -145,10 +145,15 @@ class LLMClient:
             if entry.provider in ("openai", "gemini", "google", "openrouter", "groq", "ollama", "local", "lmstudio"):
                 import openai
                 base_url = None
+                default_headers = None
                 if entry.provider in ("gemini", "google"):
                     base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
                 elif entry.provider == "openrouter":
                     base_url = "https://openrouter.ai/api/v1"
+                    default_headers = {
+                        "HTTP-Referer": "https://github.com/vihivincorp/parakit",
+                        "X-Title": "Workspace Assistant"
+                    }
                 elif entry.provider == "groq":
                     base_url = "https://api.groq.com/openai/v1"
                 elif entry.provider in ("ollama", "local", "lmstudio"):
@@ -157,12 +162,13 @@ class LLMClient:
                 client = openai.OpenAI(
                     api_key=entry.key,
                     base_url=base_url,
+                    default_headers=default_headers,
                     max_retries=0,  # Handle retries across keys in key_manager
-                    timeout=7.0
+                    timeout=20.0
                 )
             else:
                 import anthropic
-                client = anthropic.Anthropic(api_key=entry.key, timeout=7.0)
+                client = anthropic.Anthropic(api_key=entry.key, timeout=15.0)
 
             self._clients_cache[cache_key] = client
             return client
