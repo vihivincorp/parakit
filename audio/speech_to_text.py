@@ -6,6 +6,7 @@ Optimized for ultra-fast response latency (~250ms), high accuracy, and zero hall
 from dataclasses import dataclass
 import re
 import time
+import threading
 from typing import Optional
 import numpy as np
 
@@ -61,6 +62,7 @@ class SpeechToText:
         self.gnani_api_key = (gnani_api_key or os.getenv("GNANI_API_KEY", "")).strip()
         self.gnani_language_code = gnani_language_code or os.getenv("GNANI_LANGUAGE_CODE", "en-IN")
         self._sr_recognizer = None
+        self._transcribe_lock = threading.Lock()
         self._init_engine()
 
     def _init_engine(self):
@@ -242,7 +244,8 @@ class SpeechToText:
                 "model": "prisma-v3.0",
                 "language_code": self.gnani_language_code or "en-IN"
             }
-            resp = requests.post(
+            with self._transcribe_lock:
+                resp = requests.post(
                 "https://api.vachana.ai/stt/v3",
                 headers=headers,
                 files=files,

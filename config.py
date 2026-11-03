@@ -32,7 +32,7 @@ class AudioConfig:
     chunk_duration_sec: float = 0.1  # 100ms chunks for rapid 100ms VAD resolution
     device_index: int = None  # None selects system default input / microphone
     use_wasapi_loopback: bool = True  # Capture video call / meeting sound from speakers
-    audio_source: str = os.getenv("AUDIO_SOURCE", "dual")  # 'dual' (mic + call), 'loopback' (meeting call focus), 'mic' (mic only)
+    audio_source: str = os.getenv("AUDIO_SOURCE", "loopback")  # 'loopback' (meeting call focus), 'dual' (mic + call), 'mic' (mic only)
     vad_energy_threshold: float = float(os.getenv("VAD_ENERGY_THRESHOLD", "0.005"))  # Sensitive energy threshold for clear speech capture
     vad_silence_duration_sec: float = float(os.getenv("VAD_SILENCE_SEC", "0.80"))  # 0.8s silence window to prevent cut-off sentences
     stt_model: str = os.getenv("STT_MODEL", "base")  # High-accuracy local int8 Whisper base model (cached locally)

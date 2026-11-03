@@ -128,6 +128,37 @@ class VoiceActivityDetector:
             self._pre_buffer.append(audio_data)
             return None
 
+    def check_silence_timeout(self, current_time: Optional[float] = None) -> Optional[SpeechSegment]:
+        """Checks if silence timeout elapsed while waiting for chunks (e.g. WASAPI loopback pauses in calls)."""
+        if not self._in_speech:
+            return None
+        now = current_time if current_time is not None else time.time()
+        if now - self._last_speech_time >= self.silence_timeout_sec:
+            self._in_speech = False
+            total_duration = now - self._speech_start_time
+            audio_dur = (sum(len(c) for c in self._speech_buffer) / 16000.0) if self._speech_buffer else 0.0
+            if (total_duration >= self.min_speech_duration_sec or audio_dur >= self.min_speech_duration_sec) and self._speech_buffer:
+                combined_audio = np.concatenate(self._speech_buffer)
+                interviewer_count = sum(1 for s in self._speech_speakers if s == "Interviewer")
+                candidate_count = len(self._speech_speakers) - interviewer_count
+                dominant_speaker = "Interviewer" if interviewer_count >= candidate_count else "Candidate"
+
+                segment = SpeechSegment(
+                    audio=combined_audio,
+                    start_time=self._speech_start_time,
+                    end_time=self._last_speech_time,
+                    duration_sec=total_duration,
+                    speaker=dominant_speaker
+                )
+                self._speech_buffer.clear()
+                self._speech_speakers.clear()
+                return segment
+            else:
+                self._speech_buffer.clear()
+                self._speech_speakers.clear()
+                return None
+        return None
+
     def reset(self):
         """Resets detector state."""
         self._in_speech = False

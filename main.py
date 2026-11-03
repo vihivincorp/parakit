@@ -387,6 +387,13 @@ class MultimodalAssistantApp:
             try:
                 chunk_dict = self.audio_capture.read_chunk(timeout=0.2)
                 if not chunk_dict:
+                    speech_seg_idle = self.vad.check_silence_timeout(time.time())
+                    if speech_seg_idle:
+                        threading.Thread(
+                            target=self._handle_completed_speech,
+                            args=(speech_seg_idle,),
+                            daemon=True
+                        ).start()
                     continue
 
                 chunk = AudioChunk(

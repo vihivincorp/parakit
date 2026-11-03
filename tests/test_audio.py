@@ -44,6 +44,21 @@ def test_vad_speech_segmentation():
     assert seg_result.duration_sec >= 0.2
     assert len(seg_result.audio) > 0
 
+def test_vad_loopback_idle_silence_timeout():
+    """Verify WASAPI loopback idle intervals trigger sentence completion via check_silence_timeout."""
+    vad = VoiceActivityDetector(energy_threshold=0.01, silence_timeout_sec=0.2, min_speech_duration_sec=0.2)
+    t = np.linspace(0, 0.1, 1600, endpoint=False)
+    loud_tone = (np.sin(2 * np.pi * 440 * t) * 0.5).astype(np.float32)
+
+    vad.process_chunk(AudioChunk(data=loud_tone, timestamp=1.0))
+    vad.process_chunk(AudioChunk(data=loud_tone, timestamp=1.1))
+    vad.process_chunk(AudioChunk(data=loud_tone, timestamp=1.2))
+
+    seg = vad.check_silence_timeout(current_time=1.45)
+    assert seg is not None
+    assert seg.speaker == "Interviewer"
+    assert seg.duration_sec >= 0.2
+
 def test_stt_transcription():
     stt = SpeechToText()
     dummy_audio = np.zeros(16000, dtype=np.float32)
