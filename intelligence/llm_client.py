@@ -1,15 +1,17 @@
 """
 LLM Reasoning Layer interfacing with OpenRouter, OpenAI, Groq, or Anthropic.
-Provides real-time token streaming and dynamic multi-language generation matching the user's screen.
+Provides real-time token streaming, multi-key failover pool, and dynamic multi-language generation.
 """
 
 import os
+import time
 from typing import Optional, Dict, Generator
 from utils.logger import logger
 from utils.timing import time_it
+from .key_manager import key_manager, KeyManager, APIKeyEntry
 
 class LLMClient:
-    """Multimodal reasoning client with real-time streaming and screen-language intelligence."""
+    """Multimodal reasoning client with automatic multi-key failover and screen-language intelligence."""
 
     SYSTEM_PROMPT = (
         "You are an expert real-time AI desktop copilot for technical assessments, coding interviews, and live meetings (Zoom, Google Meet, MS Teams).\n"
@@ -65,84 +67,108 @@ class LLMClient:
         model_name: Optional[str] = None,
         max_tokens: int = 400,
         temperature: float = 0.2,
-        mock_mode: bool = False
+        mock_mode: bool = False,
+        mgr: Optional[KeyManager] = None
     ):
+        self.key_manager = mgr or key_manager
         self.provider = (provider or os.getenv("LLM_PROVIDER", "openai")).lower()
-        if self.provider == "mock":
-            self.mock_mode = True
-            self.api_key = ""
-            self.model_name = "offline-heuristic"
-        elif self.provider in ("ollama", "local", "lmstudio"):
-            self.local_url = os.getenv("LOCAL_LLM_BASE_URL") or (
-                "http://localhost:11434/v1" if self.provider == "ollama" else "http://localhost:1234/v1"
-            )
-            self.api_key = api_key or "ollama"
-            self.model_name = model_name or os.getenv("ASSISTANT_MODEL", "llama3.2")
-            self.mock_mode = mock_mode
-        elif self.provider == "groq":
-            self.api_key = api_key or os.getenv("GROQ_API_KEY", "")
-            self.model_name = model_name or os.getenv("ASSISTANT_MODEL", "llama-3.3-70b-versatile")
-        elif self.provider in ("openrouter", "openai"):
-            self.api_key = api_key or os.getenv("OPENAI_API_KEY", "") or os.getenv("OPENROUTER_API_KEY", "")
-            # Auto-detect OpenRouter keys starting with sk-or-v1-
-            if self.api_key.startswith("sk-or-v1-") or self.provider == "openrouter":
-                self.provider = "openrouter"
-                default_model = "openai/gpt-4o-mini"
-            else:
-                default_model = "gpt-4o-mini"
-            self.model_name = model_name or os.getenv("ASSISTANT_MODEL", default_model)
-            if self.provider == "openrouter" and "/" not in self.model_name:
-                self.model_name = f"openai/{self.model_name}"
-        else:
-            self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
-            self.model_name = model_name or os.getenv("ASSISTANT_MODEL", "claude-3-5-sonnet-latest")
-
+        self.model_name = model_name
         self.max_tokens = max_tokens
         self.temperature = temperature
-        if not hasattr(self, "mock_mode") or self.mock_mode is None:
-            self.mock_mode = mock_mode or not bool(self.api_key)
+        self.mock_mode = (self.provider == "mock") or mock_mode
         self.last_ttft_ms: float = 0.0
+        self._clients_cache: Dict[tuple, object] = {}
 
-        self._client = None
-        if not self.mock_mode:
-            try:
-                if self.provider in ("ollama", "local", "lmstudio"):
-                    import openai
-                    self._client = openai.OpenAI(
-                        base_url=self.local_url,
-                        api_key="ollama",
-                        max_retries=1
-                    )
-                    logger.info(f"Local Offline LLM client ({self.provider}) initialized with model '{self.model_name}' at {self.local_url}")
-                elif self.provider == "openrouter":
-                    import openai
-                    self._client = openai.OpenAI(
-                        base_url="https://openrouter.ai/api/v1",
-                        api_key=self.api_key,
-                        max_retries=1
-                    )
-                    logger.info(f"OpenRouter client initialized with model '{self.model_name}'")
-                elif self.provider == "groq":
-                    import openai
-                    self._client = openai.OpenAI(
-                        base_url="https://api.groq.com/openai/v1",
-                        api_key=self.api_key,
-                        max_retries=1
-                    )
-                    logger.info(f"Groq (Free Ultra-Fast) client initialized with model '{self.model_name}'")
-                elif self.provider == "openai":
-                    import openai
-                    self._client = openai.OpenAI(api_key=self.api_key, max_retries=1)
-                    logger.info(f"OpenAI (ChatGPT) client initialized with model '{self.model_name}'")
-                else:
-                    import anthropic
-                    self._client = anthropic.Anthropic(api_key=self.api_key)
-                    logger.info(f"Claude LLM client initialized with model '{self.model_name}'")
-            except Exception as e:
-                logger.warning(f"Could not initialize {self.provider} client: {e}. Switching to mock mode.")
-                self.mock_mode = True
-        else:
-            logger.info(f"LLM client ({self.provider}) running in mock/offline mode.")
+        # If a specific API key was passed directly, add/promote it in key manager
+        if api_key and not self.mock_mode:
+            detected_prov = self.key_manager.detect_provider(api_key)
+            prov = detected_prov or (self.provider if self.provider != "mock" else "openai")
+            mod = self.model_name or self.key_manager.DEFAULT_MODELS.get(prov, "gpt-4o-mini")
+            if prov == "openrouter" and "/" not in mod:
+                mod = f"openai/{mod}"
+            self.key_manager.add_key(api_key, provider=prov, model=mod, label="Config Key")
+
+    def _resolve_model_for_provider(self, provider: str, entry_model: str = "") -> str:
+        """Determines the appropriate model name matching the target provider to prevent 404s."""
+        prov = provider.lower()
+        candidate = (entry_model or "").strip()
+
+        if prov in ("gemini", "google"):
+            if candidate and "gemini" in candidate.lower() and candidate not in ("gemini-1.5-flash", "gemini-2.5-flash"):
+                return candidate
+            if self.model_name and "gemini" in self.model_name.lower() and self.model_name not in ("gemini-1.5-flash", "gemini-2.5-flash"):
+                return self.model_name
+            return "gemini-flash-lite-latest"
+
+        elif prov == "openrouter":
+            if candidate and "/" in candidate:
+                return candidate
+            if self.model_name and "/" in self.model_name:
+                return self.model_name
+            if candidate:
+                return f"openai/{candidate}"
+            return "openai/gpt-4o-mini"
+
+        elif prov == "groq":
+            if candidate and any(k in candidate.lower() for k in ("llama", "mixtral", "gemma")):
+                return candidate
+            if self.model_name and any(k in self.model_name.lower() for k in ("llama", "mixtral", "gemma")):
+                return self.model_name
+            return "llama-3.3-70b-versatile"
+
+        elif prov == "anthropic":
+            if candidate and "claude" in candidate.lower():
+                return candidate
+            if self.model_name and "claude" in self.model_name.lower():
+                return self.model_name
+            return "claude-3-5-sonnet-latest"
+
+        elif prov in ("ollama", "local", "lmstudio"):
+            if candidate and "gpt" not in candidate.lower():
+                return candidate
+            return "llama3.2"
+
+        else:  # openai
+            if candidate and not any(p in candidate.lower() for p in ("gemini", "claude", "llama")):
+                return candidate[7:] if candidate.startswith("openai/") else candidate
+            if self.model_name and not any(p in self.model_name.lower() for p in ("gemini", "claude", "llama")):
+                return self.model_name[7:] if self.model_name.startswith("openai/") else self.model_name
+            return "gpt-4o-mini"
+
+    def _get_or_create_client(self, entry: APIKeyEntry):
+        """Returns a cached client or initializes a new one for the given API key entry."""
+        cache_key = (entry.provider, entry.key)
+        if cache_key in self._clients_cache:
+            return self._clients_cache[cache_key]
+
+        try:
+            if entry.provider in ("openai", "gemini", "google", "openrouter", "groq", "ollama", "local", "lmstudio"):
+                import openai
+                base_url = None
+                if entry.provider in ("gemini", "google"):
+                    base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+                elif entry.provider == "openrouter":
+                    base_url = "https://openrouter.ai/api/v1"
+                elif entry.provider == "groq":
+                    base_url = "https://api.groq.com/openai/v1"
+                elif entry.provider in ("ollama", "local", "lmstudio"):
+                    base_url = os.getenv("LOCAL_LLM_BASE_URL", "http://localhost:11434/v1")
+
+                client = openai.OpenAI(
+                    api_key=entry.key,
+                    base_url=base_url,
+                    max_retries=0,  # Handle retries across keys in key_manager
+                    timeout=7.0
+                )
+            else:
+                import anthropic
+                client = anthropic.Anthropic(api_key=entry.key, timeout=7.0)
+
+            self._clients_cache[cache_key] = client
+            return client
+        except Exception as e:
+            logger.warning(f"Could not initialize client for {entry.provider}: {e}")
+            return None
 
     def generate_response_stream(
         self,
@@ -155,21 +181,17 @@ class LLMClient:
     ) -> Generator[str, None, None]:
         """
         Streams generated response token-by-token in real time.
-        Respects target_language detected from screen or selected by user.
-        Integrates candidate resume context for grounded interview questions.
-        Tracks TTFT (Time To First Token) for real-time latency profiling.
+        Automatically fails over across multiple API keys if rate limits (429) or errors occur.
+        Falls back to offline heuristic reasoning if all keys are exhausted.
         """
-        import time
         start_t = time.perf_counter()
         first_token_received = False
         self.last_ttft_ms = 0.0
 
-        if self.mock_mode or not self._client:
+        if self.mock_mode:
+            self.last_ttft_ms = 10.0
             full_mock = self._mock_reasoning(current_question, screen_context, audio_context, target_language, resume_context)
-            self.last_ttft_ms = 15.0
-            # Yield line by line to simulate streaming
-            lines = full_mock.split("\n")
-            for line in lines:
+            for line in full_mock.split("\n"):
                 yield line + "\n"
             return
 
@@ -179,7 +201,7 @@ class LLMClient:
                 f"--- TARGET PROGRAMMING LANGUAGE ---\n"
                 f"The user has {target_language} selected on their screen code editor.\n"
                 f"CRITICAL REQUIREMENT: If writing code, write strictly in {target_language}. "
-                f"Match the exact starter code signature (e.g. class Solution method) visible on screen.\n"
+                f"Match the exact starter code signature visible on screen.\n"
                 f"DO NOT output Python or any other language unless requested.\n\n"
             )
 
@@ -202,47 +224,87 @@ class LLMClient:
             f"--- TASK / QUESTION ---\n{current_question}"
         )
 
-        try:
-            if self.provider in ("openai", "groq", "openrouter", "ollama", "local", "lmstudio"):
-                response = self._client.chat.completions.create(
-                    model=self.model_name,
-                    max_tokens=self.max_tokens,
-                    temperature=self.temperature,
-                    messages=[
-                        {"role": "system", "content": self.SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt_content}
-                    ],
-                    stream=True
-                )
-                for chunk in response:
-                    delta = chunk.choices[0].delta.content or ""
-                    if delta:
-                        if not first_token_received:
-                            first_token_received = True
-                            self.last_ttft_ms = (time.perf_counter() - start_t) * 1000.0
-                        yield delta
-            else:
-                # Anthropic streaming
-                with self._client.messages.stream(
-                    model=self.model_name,
-                    max_tokens=self.max_tokens,
-                    temperature=self.temperature,
-                    system=self.SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": prompt_content}]
-                ) as stream:
-                    for text in stream.text_stream:
-                        if not first_token_received and text:
-                            first_token_received = True
-                            self.last_ttft_ms = (time.perf_counter() - start_t) * 1000.0
-                        yield text
+        # Attempt calls across available keys in rotation pool
+        keys_pool = self.key_manager.get_all_keys()
+        max_attempts = max(1, len(keys_pool))
 
-        except Exception as e:
-            err_str = str(e)
-            logger.warning(f"Error streaming from {self.provider} API: {err_str}. Switching to offline fallback reasoning.")
-            yield f"[Offline Fallback Active - Network Unavailable]\n\n"
-            fallback = self._mock_reasoning(current_question, screen_context, audio_context, target_language, resume_context)
-            for line in fallback.split("\n"):
-                yield line + "\n"
+        for attempt in range(max_attempts):
+            entry = self.key_manager.get_active_key()
+            if not entry or not entry.key:
+                break
+
+            client = self._get_or_create_client(entry)
+            if not client:
+                self.key_manager.rotate_to_next_working_key("Client initialization failed")
+                continue
+
+            model_to_use = self._resolve_model_for_provider(entry.provider, entry.model)
+
+            try:
+                if entry.provider in ("openai", "gemini", "google", "openrouter", "groq", "ollama", "local", "lmstudio"):
+                    response = client.chat.completions.create(
+                        model=model_to_use,
+                        max_tokens=self.max_tokens,
+                        temperature=self.temperature,
+                        messages=[
+                            {"role": "system", "content": self.SYSTEM_PROMPT},
+                            {"role": "user", "content": prompt_content}
+                        ],
+                        stream=True
+                    )
+                    tokens_streamed = 0
+                    for chunk in response:
+                        delta = chunk.choices[0].delta.content or ""
+                        if delta:
+                            if not first_token_received:
+                                first_token_received = True
+                                self.last_ttft_ms = (time.perf_counter() - start_t) * 1000.0
+                            tokens_streamed += 1
+                            yield delta
+
+                    if tokens_streamed > 0:
+                        self.key_manager.report_success(entry.key)
+                        return
+
+                else:
+                    # Anthropic streaming
+                    with client.messages.stream(
+                        model=model_to_use,
+                        max_tokens=self.max_tokens,
+                        temperature=self.temperature,
+                        system=self.SYSTEM_PROMPT,
+                        messages=[{"role": "user", "content": prompt_content}]
+                    ) as stream:
+                        tokens_streamed = 0
+                        for text in stream.text_stream:
+                            if not first_token_received and text:
+                                first_token_received = True
+                                self.last_ttft_ms = (time.perf_counter() - start_t) * 1000.0
+                            if text:
+                                tokens_streamed += 1
+                                yield text
+
+                        if tokens_streamed > 0:
+                            self.key_manager.report_success(entry.key)
+                            return
+
+            except Exception as e:
+                err_str = str(e)
+                status_code = getattr(e, "status_code", None)
+                logger.warning(
+                    f"API call failed with key {entry.masked_key} ({entry.provider}): {err_str[:90]}"
+                )
+                next_entry = self.key_manager.report_failure(entry.key, err_str, status_code)
+                if next_entry and next_entry.key != entry.key:
+                    yield f"⚠️ *API Error on {entry.provider} ({entry.masked_key}). Automatically switching to fallback key ({next_entry.provider}/{next_entry.model})...*\n\n"
+                    continue
+                else:
+                    break
+
+        # All keys failed or no working key available
+        active_k = self.key_manager.get_active_key()
+        prov_info = f"{active_k.provider.upper()}" if active_k else "Cloud"
+        yield f"⚠️ **API Key Error**: All {prov_info} API keys in your rotation pool are exhausted, invalid, or disconnected.\n\nPlease click 🔑 in the top header to enter a valid Gemini, OpenAI, or Groq API key."
 
     @time_it("llm_reasoning")
     def generate_response(
@@ -254,9 +316,7 @@ class LLMClient:
         target_language: str = "Auto-Detect",
         resume_context: str = ""
     ) -> str:
-        """
-        Synchronously gathers all tokens from the stream.
-        """
+        """Synchronously gathers all tokens from the stream."""
         tokens = []
         for token in self.generate_response_stream(
             screen_context=screen_context,
@@ -270,125 +330,28 @@ class LLMClient:
         return "".join(tokens).strip()
 
     def _mock_reasoning(self, question: str, screen: str, audio: str, target_lang: str = "Python 3", resume: str = "") -> str:
-        """Generates realistic synthesized response matching universal screen context or resume."""
+        """Internal mock generator used strictly for unit testing mock_mode without real API keys."""
         lower_q = (question or "").lower()
         lower_screen = (screen or "").lower()
 
-        # 0. Resume & Project Grounded Answers (First-person candidate voice)
-        if "hirematrix" in lower_q or "career intelligence" in lower_q or ("challenge" in lower_q and ("project" in lower_q or "experience" in lower_q)):
-            return (
-                "In developing my **AI Career Intelligence Platform (HireMatrix)** (built with Python, FastAPI, React, NLP, LLMs, and Neo4j), I tackled three primary engineering challenges:\n\n"
-                "1. **Unstructured Resume Parsing & Skill Normalization**: Candidate resumes varied wildly in layout, format, and terminology (e.g. 'React.js' vs 'React', 'FastAPI' vs 'Python Web'). I implemented an NLP extraction pipeline with embedding-based taxonomy deduplication to map heterogeneous terms into a standardized skill graph.\n\n"
-                "2. **Graph-Based Skill-Gap Modeling in Neo4j**: Traversing relationships between candidate skills, target industry roles, and learning trajectories caused performance bottlenecks. I optimized the Cypher graph schema (`Candidate-[:HAS_SKILL]->Skill<-[:REQUIRES]-Role`) and applied index lookups to achieve sub-second match scoring.\n\n"
-                "3. **LLM Latency & Roadmap Determinism**: Raw LLM generation for career roadmaps was high latency and occasionally hallucinated non-existent skills. I implemented FastAPI async endpoints, Pydantic schema validation, and structured prompt caching to deliver deterministic, structured roadmaps in real time.\n\n"
-                "This architecture achieved sub-second graph query responses, eliminated extraction redundancies, and generated accurate, data-driven skill gap roadmaps."
-            )
+        if "hirematrix" in lower_q or "challenge" in lower_q:
+            return "In developing my AI Career Intelligence Platform (HireMatrix), I tackled challenges in resume parsing and Neo4j graph modeling."
 
         if "pitch" in lower_q or "elevator" in lower_q:
-            return (
-                "**90-Second Interview Elevator Pitch**:\n\n"
-                "\"Hello! I'm **Jayakrishna Gude**, a Computer Science Engineer specializing in Full-Stack and AI engineering with a focus on high-performance Python, FastAPI, and LLM systems.\n\n"
-                "Over the past few years, I've focused on engineering data-driven intelligence platforms. "
-                "Most notably, I built the **AI Career Intelligence Platform (HireMatrix)**, where I utilized NLP, LLMs, and Neo4j graph modeling to parse candidate resumes, perform multi-hop skill-gap analysis, and generate personalized learning trajectories.\n\n"
-                "I also developed **GitProof**, a developer intelligence platform built with Next.js, TypeScript, and the GitHub REST API that evaluates real commit histories, pull requests, and code contributions into verifiable Proof-of-Work developer cards. "
-                "Additionally, during my internship with Infosys Springboard on **TextMorph AI**, I integrated DistilBART and RoBERTa models to build high-efficiency document summarization and Q&A microservices, and served as a Teaching Assistant at Apna College resolving 100+ application bugs and mentoring in DSA.\n\n"
-                "I thrive at the intersection of robust backend engineering, graph databases, and modern generative AI. I'm excited to bring this end-to-end engineering mindset to your team and build scalable, intelligent software.\""
-            )
+            return "Elevator Pitch: Hello! I'm Jayakrishna Gude, a Computer Science Engineer specializing in Full-Stack and AI engineering with Python, FastAPI, and LLM systems. Most notably, I built HireMatrix, an AI Career Intelligence Platform, and GitProof."
 
         if resume or "resume" in lower_q or "self intro" in lower_q or "introduce yourself" in lower_q:
-            return (
-                "I am a Full-Stack & AI Engineer specializing in Python, FastAPI, React, and LLM-powered intelligent systems.\n\n"
-                "• **AI Career Intelligence Platform (HireMatrix)**: Built an NLP & Neo4j platform for automated resume skill-gap analysis and personalized learning trajectories.\n"
-                "• **GitProof Platform**: Engineered a developer intelligence platform using Next.js, TypeScript, and GitHub REST APIs for verifiable Proof of Work evaluation.\n"
-                "• **Core Strengths**: High-concurrency Python/FastAPI backends, graph data modeling in Neo4j, LLM orchestration/RAG, and structured debugging."
-            )
+            return "I am an AI Engineer specializing in Python, FastAPI, and LLM systems based on my candidate profile."
 
-        # 1. Assessment / Multiple Choice Question (MCQ)
-        if "which of the following" in lower_screen or "option a" in lower_screen or "option b" in lower_screen or "mcq" in lower_q:
-            return (
-                "**Correct Answer: Option B: O(log N)**\n\n"
-                "Explanation: Binary search operates by repeatedly dividing the sorted search space in half, "
-                "achieving logarithmic time complexity O(log N). Linear search is O(N) and quadratic comparisons are O(N^2)."
-            )
+        if "option b" in lower_screen or "bubble sort" in lower_screen or "quick sort" in lower_screen:
+            return "Correct Answer: Option B (Quick Sort runs in O(N log N))."
 
-        # 2. Terminal / Error Log / Debugging
-        if "traceback" in lower_screen or "error:" in lower_screen or "exception" in lower_screen:
-            return (
-                "**Root Cause**: Unhandled exception or missing package in runtime environment.\n\n"
-                "**Recommended Fix**:\n"
-                "```bash\n"
-                "pip install -r requirements.txt\n"
-                "```\n"
-                "Ensure all environment variables in .env are populated before relaunching."
-            )
+        if "modulenotfounderror" in lower_screen or "traceback" in lower_screen:
+            return "Root Cause: Missing module. Fix: Run pip install foo to resolve the issue."
 
-        # 3. Model Accuracy / ML Questions
-        if "random forest" in lower_q or "random forest" in lower_screen:
-            return (
-                "Random Forest was chosen because it achieved 91.4% validation accuracy "
-                "and an F1-score of 0.89, outperforming Logistic Regression's 78.1%."
-            )
-        elif "accuracy" in lower_q or "metric" in lower_q:
-            return (
-                "The screen reports a model accuracy of 91.4% with an F1 score of 0.89 "
-                "on the validation set."
-            )
+        lang = target_lang if target_lang and target_lang != "Auto-Detect" else "Python"
+        if "c++" in lang.lower() or "c++" in lower_screen:
+            return "Coding Problem Analysis (C++): Use a Hash Map for O(N) complexity.\n```cpp\nclass Solution { unordered_map<int, int> seen; vector<int> twoSum(vector<int>& nums, int target) {} };\n```"
 
-        # 4. Coding & LeetCode Solution
-        lang = "Python 3" if target_lang == "Auto-Detect" else target_lang
-        
-        if "c++" in lang.lower():
-            code_block = (
-                "```cpp\n"
-                "class Solution {\n"
-                "public:\n"
-                "    vector<int> twoSum(vector<int>& nums, int target) {\n"
-                "        unordered_map<int, int> seen;\n"
-                "        for (int i = 0; i < nums.size(); ++i) {\n"
-                "            int diff = target - nums[i];\n"
-                "            if (seen.count(diff)) return {seen[diff], i};\n"
-                "            seen[nums[i]] = i;\n"
-                "        }\n"
-                "        return {};\n"
-                "    }\n"
-                "};\n"
-                "```"
-            )
-        elif "java" in lang.lower():
-            code_block = (
-                "```java\n"
-                "class Solution {\n"
-                "    public int[] twoSum(int[] nums, int target) {\n"
-                "        Map<Integer, Integer> seen = new HashMap<>();\n"
-                "        for (int i = 0; i < nums.length; i++) {\n"
-                "            int diff = target - nums[i];\n"
-                "            if (seen.containsKey(diff)) return new int[]{seen.get(diff), i};\n"
-                "            seen.put(nums[i], i);\n"
-                "        }\n"
-                "        return new int[]{};\n"
-                "    }\n"
-                "}\n"
-                "```"
-            )
-        else:
-            code_block = (
-                "```python\n"
-                "class Solution:\n"
-                "    def twoSum(self, nums: List[int], target: int) -> List[int]:\n"
-                "        seen = {}\n"
-                "        for i, num in enumerate(nums):\n"
-                "            diff = target - num\n"
-                "            if diff in seen:\n"
-                "                return [seen[diff], i]\n"
-                "            seen[num] = i\n"
-                "        return []\n"
-                "```"
-            )
+        return f"Mock Analysis ({lang}): Solution for {question}"
 
-        return (
-            f"Screen Solution ({lang}):\n"
-            f"• Approach: Use a Hash Map to store seen elements and lookup complement in O(1) time.\n"
-            f"• Edge Cases: Single pair matching, negative integers, duplicate values.\n"
-            f"• Complexity: O(n) Time, O(n) Space.\n\n"
-            f"{code_block}"
-        )

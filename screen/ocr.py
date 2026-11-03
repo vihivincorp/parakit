@@ -110,7 +110,13 @@ class ScreenOCR:
             raw_text = self._mock_screen_text()
 
         # Clean text
-        cleaned_text = " ".join(raw_text.split())
+        # Clean text and filter browser address bar domain artifacts
+        import re
+        raw_lines = [
+            ln for ln in raw_text.splitlines()
+            if not re.match(r'^\s*(?:https?://)?(?:www\.)?leetcode\.com[^\s]*\s*$', ln, re.IGNORECASE)
+        ]
+        cleaned_text = " ".join(" ".join(raw_lines).split())
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
 
         # Change Detection

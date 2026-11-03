@@ -30,28 +30,12 @@ HALLUCINATION_PATTERNS = {
     "thanks for watching", "thanks for watching.", "subtitles by", "please subscribe",
     "thank you for watching", "thank you for watching.", "like and subscribe",
     "subscribe", "see you in the next video", "see you next time", "good luck",
-    "bye", "bye.", "okay", "so", "f", "ff", "uh", "um", "you", "a", "the"
+    "bye", "bye.", "okay", "so", "f", "ff", "uh", "um", "you", "a", "the",
+    "www.leetcode.com", "leetcode.com", "http://leetcode.com", "https://leetcode.com",
+    "http://www.leetcode.com", "https://www.leetcode.com", "www.leetcode.com.", "leetcode.com.",
+    "leetcode", "leet code", "lead code", "www.leetcode", "leetcode com"
 }
 
-# Technical term phonetic & soundalike corrections
-PHONETIC_CORRECTIONS = [
-    (re.compile(r'\b(?:higher|hire)\s+(?:matrix|metrics)\b', re.IGNORECASE), "HireMatrix"),
-    (re.compile(r'\bneo\s*(?:4|for)\s*j\b', re.IGNORECASE), "Neo4j"),
-    (re.compile(r'\b(?:fast|first)\s+api\b', re.IGNORECASE), "FastAPI"),
-    (re.compile(r'\b(?:lead|leet)\s+code\b', re.IGNORECASE), "LeetCode"),
-    (re.compile(r'\b(?:cooper|kuber)\s*net(?:ies|ees|es)\b', re.IGNORECASE), "Kubernetes"),
-    (re.compile(r'\bpie\s+torch\b', re.IGNORECASE), "PyTorch"),
-    (re.compile(r'\b(?:get|git)\s+proof\b', re.IGNORECASE), "GitProof"),
-    (re.compile(r'\btext\s+morph\b', re.IGNORECASE), "TextMorph"),
-    (re.compile(r'\b(?:dyke|dike)\s*stra\b', re.IGNORECASE), "Dijkstra"),
-    (re.compile(r'\b(?:too|to)\s+sum\b', re.IGNORECASE), "Two Sum"),
-    (re.compile(r'\bbreath\s+first\s+search\b', re.IGNORECASE), "breadth first search"),
-    (re.compile(r'\bdeath\s+first\s+search\b', re.IGNORECASE), "depth first search"),
-    (re.compile(r'\bno\s*sequel\b', re.IGNORECASE), "NoSQL"),
-    (re.compile(r'\bsci[\s-]?kit[\s-]?learn\b', re.IGNORECASE), "Scikit-learn"),
-    (re.compile(r'\bdistil[\s-]?bart\b', re.IGNORECASE), "DistilBART"),
-    (re.compile(r'\bro[\s-]?berta\b', re.IGNORECASE), "RoBERTa"),
-]
 
 class SpeechToText:
     """Transcribes speech audio segments into real timestamped text with hallucination suppression."""
@@ -62,20 +46,40 @@ class SpeechToText:
         engine: str = "faster-whisper",
         task: str = "transcribe",
         language: str = "en",
-        beam_size: int = 1,
-        initial_prompt: Optional[str] = "Technical coding interview, HireMatrix, algorithms, data structures, Neo4j, FastAPI, LeetCode, programming questions."
+        beam_size: int = 3,
+        initial_prompt: Optional[str] = "Technical interview conversation between candidate and interviewer. Questions regarding projects, experience, resume, system design, explain your project, how it operates, coding problems, algorithms, bug fixes, architecture, HireMatrix, Python, Neo4j, FastAPI.",
+        gnani_api_key: Optional[str] = None,
+        gnani_language_code: str = "en-IN"
     ):
+        import os
         self.model_size = model_size if model_size else "base"
         self.engine_name = engine.lower() if engine else "faster-whisper"
         self.task = task.lower() if task else "transcribe"
         self.language = "en" if (not language or language.lower() in ("auto", "none")) else language
         self.beam_size = beam_size
         self.initial_prompt = initial_prompt
+        self.gnani_api_key = (gnani_api_key or os.getenv("GNANI_API_KEY", "")).strip()
+        self.gnani_language_code = gnani_language_code or os.getenv("GNANI_LANGUAGE_CODE", "en-IN")
         self._sr_recognizer = None
         self._init_engine()
 
     def _init_engine(self):
-        """Initializes STT engine: prioritizing faster-whisper or google based on configuration."""
+        """Initializes STT engine: prioritizing gnani, faster-whisper, or google based on configuration."""
+        # 1. Gnani.ai Prisma STT (Indian English & regional language specialist)
+        if self.engine_name in ("gnani", "gnani-ai", "vachana") or (self.gnani_api_key and self.engine_name == "auto"):
+            if self.gnani_api_key:
+                self.engine_name = "gnani"
+                logger.info(f"Real-Time Speech-to-Text active via Gnani.ai Prisma v3.0 (Lang={self.gnani_language_code}).")
+                # Also load local faster-whisper as offline fallback in case of network interruption
+                try:
+                    from faster_whisper import WhisperModel
+                    self._model = WhisperModel(self.model_size if self.model_size not in ("tiny.en", "base.en") else "base", device="cpu", compute_type="int8")
+                except Exception:
+                    pass
+                return
+            else:
+                logger.warning("Gnani engine requested but GNANI_API_KEY is not set. Falling back to local faster-whisper.")
+
         if self.engine_name in ("faster-whisper", "auto"):
             try:
                 from faster_whisper import WhisperModel
@@ -123,21 +127,43 @@ class SpeechToText:
 
         # Energy gate: check peak amplitude to prevent transcribing microscopic room noise
         peak_amp = float(np.max(np.abs(segment.audio)))
-        if peak_amp < 0.020:
+        if peak_amp < 0.012:
             return None
+
+        # Normalize audio volume so Whisper receives optimal dynamic range (~ -14 dB to -20 dBFS)
+        # Low microphone gain (< 0.08 peak) causes Whisper to mishear phonemes.
+        if peak_amp > 0.001:
+            audio_norm = (segment.audio / peak_amp * 0.92).astype(np.float32)
+        else:
+            audio_norm = segment.audio
 
         text = ""
         confidence = 0.95
 
         try:
-            if self.engine_name == "faster-whisper" and hasattr(self, "_model"):
+            if self.engine_name == "gnani" and self.gnani_api_key:
+                text = self._transcribe_gnani(audio_norm)
+                # If network fails or Gnani returns empty, fall back seamlessly to faster-whisper
+                if not text and hasattr(self, "_model"):
+                    logger.debug("Gnani API silent/timeout, attempting local faster-whisper fallback...")
+                    segments, info = self._model.transcribe(
+                        audio_norm,
+                        beam_size=max(3, self.beam_size),
+                        language=self.language,
+                        task=self.task,
+                        vad_filter=False,
+                        initial_prompt=self.initial_prompt
+                    )
+                    text = " ".join([s.text for s in segments]).strip()
+
+            elif self.engine_name == "faster-whisper" and hasattr(self, "_model"):
+                effective_beam = max(3, self.beam_size)
                 segments, info = self._model.transcribe(
-                    segment.audio,
-                    beam_size=self.beam_size,
+                    audio_norm,
+                    beam_size=effective_beam,
                     language=self.language,
                     task=self.task,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=400, threshold=0.35),
+                    vad_filter=False,  # vad.py already filtered & segmented speech; double VAD drops opening/closing phonemes
                     condition_on_previous_text=False,
                     temperature=0.0,
                     no_repeat_ngram_size=3,
@@ -153,7 +179,7 @@ class SpeechToText:
 
             elif (self.engine_name in ("speech_recognition", "google")) and self._sr_recognizer:
                 import speech_recognition as sr
-                audio_float = np.clip(segment.audio, -1.0, 1.0)
+                audio_float = np.clip(audio_norm, -1.0, 1.0)
                 pcm_bytes = (audio_float * 32767).astype(np.int16).tobytes()
 
                 audio_data = sr.AudioData(
@@ -190,6 +216,52 @@ class SpeechToText:
             speaker=getattr(segment, "speaker", "Interviewer")
         )
 
+    def _transcribe_gnani(self, audio_data: np.ndarray) -> Optional[str]:
+        """Transcribes audio using Gnani.ai Prisma v3.0 REST API (specialized for Indian English & regional accents)."""
+        import io
+        import wave
+        import requests
+
+        try:
+            pcm16 = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(pcm16.tobytes())
+            wav_buffer.seek(0)
+
+            headers = {
+                "X-API-Key-ID": self.gnani_api_key
+            }
+            files = {
+                "audio_file": ("speech.wav", wav_buffer, "audio/wav")
+            }
+            data = {
+                "model": "prisma-v3.0",
+                "language_code": self.gnani_language_code or "en-IN"
+            }
+            resp = requests.post(
+                "https://api.vachana.ai/stt/v3",
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=5.0
+            )
+            if resp.status_code == 200:
+                res_json = resp.json()
+                t = res_json.get("transcript") or res_json.get("text") or ""
+                if isinstance(t, list):
+                    t = " ".join(t)
+                return str(t).strip()
+            else:
+                logger.warning(f"Gnani STT API returned status {resp.status_code}: {resp.text[:120]}")
+                return None
+        except Exception as e:
+            logger.warning(f"Gnani STT transcription exception: {e}")
+            return None
+
     def _clean_transcript(self, raw_text: str) -> Optional[str]:
         """Filters hallucinations, character repetitions (e.g. 'ffffff'), and repetition loops."""
         if not raw_text:
@@ -200,6 +272,9 @@ class SpeechToText:
 
         # 2. Strip leading punctuation artifacts, preserve terminal sentence punctuation (? .)
         text = text.lstrip(" '\"`.,-!?:;").rstrip(" '\"`-,;:")
+        # 2b. Discard pure URL tokens or website domain hallucinations (e.g. www.leetcode.com)
+        if re.search(r'\bleetcode\.com\b', text, re.IGNORECASE) or re.match(r'^(?:https?://)?(?:www\.)?[a-zA-Z0-9-]+\.(?:com|org|net|io|edu)(?:/[^\s]*)?$', text, re.IGNORECASE):
+            return None
         if not text or len(text) < 2:
             return None
 
@@ -238,9 +313,7 @@ class SpeechToText:
             if tokens[:mid] == tokens[mid:2*mid]:
                 text = " ".join(tokens[mid:])
 
-        # 7. Apply phonetic soundalike normalization for tech terms & project names
-        for pattern, replacement in PHONETIC_CORRECTIONS:
-            text = pattern.sub(replacement, text)
+
 
         return text.strip()
 
@@ -251,7 +324,7 @@ class SpeechToText:
         cleaned = [str(w).strip() for w in keywords if w and len(str(w).strip()) > 1]
         if not cleaned:
             return
-        base = self.initial_prompt or "Technical coding interview, algorithms, LeetCode."
+        base = self.initial_prompt or "Technical coding interview, algorithms, data structures."
         # Append new keywords without excessive duplication
         current_lower = base.lower()
         new_terms = [t for t in cleaned if t.lower() not in current_lower]

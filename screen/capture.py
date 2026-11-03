@@ -8,11 +8,24 @@ from PIL import Image
 from utils.logger import logger
 from utils.timing import time_it
 
+def ensure_default_desktop():
+    """Ensures calling thread is attached to the interactive Windows user desktop."""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        h_default = user32.OpenDesktopW("Default", 0, False, 0x10000000)
+        if h_default:
+            user32.SetThreadDesktop(h_default)
+            user32.CloseDesktop(h_default)
+    except Exception:
+        pass
+
 class ScreenCapture:
     """Manages high-fps screen capture of full monitors or specific sub-regions."""
 
     def __init__(self, monitor_index: int = 1):
         self.monitor_index = monitor_index
+        ensure_default_desktop()
         self._sct = mss.MSS() if hasattr(mss, "MSS") else mss.mss()
 
     @time_it("screen_capture")
@@ -26,6 +39,7 @@ class ScreenCapture:
         Returns:
             PIL Image in RGB format.
         """
+        ensure_default_desktop()
         monitors = self._sct.monitors
         if self.monitor_index < len(monitors):
             monitor = monitors[self.monitor_index]
@@ -48,6 +62,26 @@ class ScreenCapture:
             img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
             return img
         except Exception as e:
+            # Fallback to PIL ImageGrab before virtual frame
+            try:
+                from PIL import ImageGrab
+                if crop_box:
+                    bbox = crop_box
+                elif "width" in grab_region and "height" in grab_region and "left" in grab_region and "top" in grab_region:
+                    bbox = (
+                        int(grab_region["left"]),
+                        int(grab_region["top"]),
+                        int(grab_region["left"] + grab_region["width"]),
+                        int(grab_region["top"] + grab_region["height"])
+                    )
+                else:
+                    bbox = None
+                ig_img = ImageGrab.grab(bbox=bbox)
+                if ig_img:
+                    return ig_img.convert("RGB")
+            except Exception as e_ig:
+                logger.debug(f"ImageGrab fallback error: {e_ig}")
+
             logger.debug(f"Direct desktop capture unavailable ({e}); generating virtual display frame.")
             return self._generate_virtual_frame(grab_region)
 

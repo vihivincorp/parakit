@@ -40,3 +40,26 @@ def test_windows_exclusion_lifecycle():
     assert revert_success is True
 
     root.destroy()
+
+def test_global_hotkey_parsing():
+    from windows.global_hotkey import GlobalHotkeyListener, MOD_ALT, MOD_NOREPEAT
+    listener = GlobalHotkeyListener(key="m", modifiers=("alt",))
+    assert listener._parse_modifiers() == (MOD_ALT | MOD_NOREPEAT)
+    assert listener._parse_vk() == ord('M')
+
+def test_global_hotkey_listener_lifecycle():
+    from windows.global_hotkey import GlobalHotkeyListener
+    import time
+    called = []
+    # Use dedicated test combo and ID to prevent collision with running assistant
+    listener = GlobalHotkeyListener(
+        key="f11",
+        modifiers=("ctrl", "shift", "alt"),
+        callback=lambda: called.append(True),
+        hotkey_id=9876
+    )
+    assert listener.start() is True
+    time.sleep(0.2)
+    assert listener._is_running is True
+    listener.stop()
+    assert listener._is_running is False

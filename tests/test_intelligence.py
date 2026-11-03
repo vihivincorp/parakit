@@ -49,27 +49,36 @@ def test_question_detector():
     assert f1.category == IntentCategory.IRRELEVANT
     assert f1.trigger_llm is False
 
+    # LeetCode domain / URL noise suppression
+    u1 = qd.detect("www.leetcode.com")
+    assert u1.category == IntentCategory.IRRELEVANT
+    assert u1.trigger_llm is False
+
+    u2 = qd.detect("https://leetcode.com/problems/two-sum")
+    assert u2.category == IntentCategory.IRRELEVANT
+    assert u2.trigger_llm is False
+
 def test_llm_client_mock_mode():
     client = LLMClient(mock_mode=True)
     ans = client.generate_response(
-        screen_context="Random Forest Accuracy = 91.4%",
-        audio_context="Why did you choose Random Forest?",
+        screen_context="Screen context",
+        audio_context="",
         conversation_history="",
-        current_question="Why did you choose Random Forest?"
+        current_question="Test query"
     )
-    assert "Random Forest" in ans
-    assert "91.4%" in ans
+    assert "Mock Analysis" in ans
+    assert "Test query" in ans
 
 def test_llm_client_offline_mock_provider():
     client = LLMClient(provider="mock")
     assert client.mock_mode is True
     ans = client.generate_response(
-        screen_context="which of the following Option B: O(log N)",
-        audio_context="Which option is correct?",
+        screen_context="Screen context",
+        audio_context="",
         conversation_history="",
         current_question="which of the following option is correct"
     )
-    assert "Option B" in ans
+    assert "Mock Analysis" in ans
 
 def test_response_manager_deduplication():
     rm = ResponseManager(debounce_interval_sec=1.0)
@@ -84,3 +93,48 @@ def test_response_manager_deduplication():
     r2 = rm.process_and_dispatch("Question 1", "Answer 1", on_response_ready=received.append)
     assert r2 is None
     assert len(received) == 1  # Not duplicated!
+
+
+def test_key_manager_gemini_support(tmp_path):
+    from intelligence.key_manager import KeyManager
+    km = KeyManager(storage_path=str(tmp_path / "test_gemini_keys.json"))
+
+    # 1. Test auto-detection
+    assert km.detect_provider("AIzaSyB1234567890ABCDEF12345") == "gemini"
+    assert km.detect_provider("AIzaCustomGoogleKey12345") == "gemini"
+    assert km.DEFAULT_MODELS["gemini"] == "gemini-flash-lite-latest"
+
+    # 2. Add Gemini key
+    entry = km.add_key("AIzaSyB1234567890ABCDEF12345", provider="gemini", label="My Gemini Key")
+    assert entry.provider == "gemini"
+    assert entry.model == "gemini-flash-lite-latest"
+    assert entry.label == "My Gemini Key"
+    assert entry.masked_key == "AIzaSy...2345"
+
+    # 3. Failover rotation to Gemini
+    km.keys.clear()
+    k1 = km.add_key("sk-primary-key-11111111111", provider="openai")
+    k2 = km.add_key("AIzaSyBackupGeminiKey22222", provider="gemini")
+
+    active = km.get_active_key()
+    assert active.key == k1.key
+
+    # Report 429 on primary
+    next_k = km.report_failure(k1.key, "429 Rate Limit Exceeded", status_code=429)
+    assert next_k is not None
+    assert next_k.key == k2.key
+    assert next_k.provider == "gemini"
+
+
+def test_llm_client_gemini_client_configuration(tmp_path):
+    from intelligence.key_manager import KeyManager
+    km = KeyManager(storage_path=str(tmp_path / "test_gemini_client.json"))
+    km.keys.clear()
+
+    entry = km.add_key("AIzaSyTestGeminiKey123456789", provider="gemini")
+    client = LLMClient(mgr=km)
+
+    # Verify client setup for Gemini routes to Google's official OpenAI-compatible endpoint
+    openai_client = client._get_or_create_client(entry)
+    assert openai_client is not None
+    assert "generativelanguage.googleapis.com" in str(openai_client.base_url)

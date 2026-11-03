@@ -96,15 +96,17 @@ def test_stt_translation_mode():
     assert stt.task == "translate"
     assert stt.beam_size == 3
 
-def test_stt_phonetic_soundalike_normalization():
-    """Verify phonetic errors and speech misspellings are automatically normalized."""
+def test_stt_clean_transcript():
+    """Verify clean_transcript strips hallucinations, noise loops, and punctuation without offline phonetics."""
     stt = SpeechToText(model_size="tiny")
-    raw_sample = "Explain the challenges in higher matrix using neo 4 j and fast api on lead code"
+    raw_sample = "   ...ffff How are you doing?   "
     cleaned = stt._clean_transcript(raw_sample)
-    assert "HireMatrix" in cleaned
-    assert "Neo4j" in cleaned
-    assert "FastAPI" in cleaned
-    assert "LeetCode" in cleaned
+    assert cleaned == "How are you doing?"
+    # Known noise hallucination filtered to None
+    assert stt._clean_transcript("Thank you for watching. Please subscribe.") is None
+    assert stt._clean_transcript("www.leetcode.com") is None
+    assert stt._clean_transcript("https://leetcode.com/problem/two-sum") is None
+    assert stt._clean_transcript("leetcode.com") is None
 
 def test_stt_domain_vocabulary_update():
     """Verify dynamic vocabulary injection enriches Whisper initial prompt."""
@@ -114,4 +116,39 @@ def test_stt_domain_vocabulary_update():
     assert "GitProof" in stt.initial_prompt
     assert "TextMorph" in stt.initial_prompt
 
+def test_gnani_stt_initialization():
+    """Verify Gnani engine initialization with API key and language code."""
+    stt = SpeechToText(
+        engine="gnani",
+        gnani_api_key="test_gnani_key_12345",
+        gnani_language_code="en-IN"
+    )
+    assert stt.engine_name == "gnani"
+    assert stt.gnani_api_key == "test_gnani_key_12345"
+    assert stt.gnani_language_code == "en-IN"
+
+def test_gnani_transcribe_mock(monkeypatch):
+    """Verify Gnani REST API mock response parsing."""
+    stt = SpeechToText(
+        engine="gnani",
+        gnani_api_key="test_gnani_key_12345",
+        gnani_language_code="en-IN"
+    )
+
+    class MockResponse:
+        status_code = 200
+        def json(self):
+            return {
+                "success": True,
+                "transcript": "Explain your project architecture"
+            }
+
+    import requests
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: MockResponse())
+
+    dummy_audio = np.ones(16000, dtype=np.float32) * 0.2
+    seg = SpeechSegment(audio=dummy_audio, start_time=0.0, end_time=1.0, duration_sec=1.0)
+    transcript = stt.transcribe(seg)
+    assert transcript is not None
+    assert "explain your project architecture" in transcript.text.lower()
 

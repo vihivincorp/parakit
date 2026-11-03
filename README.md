@@ -63,12 +63,22 @@ IMAGE PREPROCESSING               VAD / SEGMENTATION
 ### 1. Configuration (`.env`)
 Create a `.env` file or copy from `.env.example`:
 ```ini
-# Choose 'openai' or 'anthropic'
-LLM_PROVIDER=openai
+# Choose 'gemini', 'openai', 'openrouter', 'groq', or 'anthropic'
+LLM_PROVIDER=gemini
 
-# OpenAI (ChatGPT)
-OPENAI_API_KEY=your_openai_api_key_here
-ASSISTANT_MODEL=gpt-4o-mini
+# Google Gemini (Free fast keys from https://aistudio.google.com/)
+GEMINI_API_KEY=your_gemini_api_key_here
+ASSISTANT_MODEL=gemini-1.5-flash
+
+# Or OpenAI:
+# LLM_PROVIDER=openai
+# OPENAI_API_KEY=your_openai_api_key_here
+# ASSISTANT_MODEL=gpt-4o-mini
+
+# Or Groq:
+# LLM_PROVIDER=groq
+# GROQ_API_KEY=your_groq_api_key_here
+# ASSISTANT_MODEL=llama-3.3-70b-versatile
 
 # Or Anthropic Claude:
 # LLM_PROVIDER=anthropic
@@ -76,16 +86,40 @@ ASSISTANT_MODEL=gpt-4o-mini
 # ASSISTANT_MODEL=claude-3-5-sonnet-latest
 
 OVERLAY_TRANSPARENCY=0.92
-EXCLUDE_FROM_CAPTURE=true
+EXCLUDE_FROM_CAPTURE=false
 ```
 *(Note: If no API key is provided, the assistant automatically runs in mock/simulation mode so you can test all UI, audio, screen, and capture-exclusion features offline).*
 
 ### 2. Running the Application
 
-* **Run Assistant Live**:
+* **Start in Background (Detached — Safe to close terminal!)**:
   ```powershell
-  python main.py
+  python main.py start
+  # or simply: .\start.bat
   ```
+
+* **Check Background Status**:
+  ```powershell
+  python main.py status
+  # or simply: .\status.bat
+  ```
+
+* **Stop Background Assistant**:
+  ```powershell
+  python main.py stop
+  # or simply: .\stop.bat
+  ```
+
+* **Restart Background Assistant**:
+  ```powershell
+  python main.py restart
+  # or simply: .\restart.bat
+  ```
+
+* **Keyboard Shortcut & Overlay Controls**:
+  - **`Alt + M`**: System-wide global hotkey to **Minimize** or **Restore** the floating overlay at any time from any app.
+  - **`—` Button**: Click the minimize dash button in the header bar.
+  - **`🔑 Keys` Button**: Opens the real-time API Key & Failover Manager dialog to test, add, promote, and view live pool rotation.
 
 * **Run Automated Simulation (Simulates Screen Data + Spoken Question)**:
   ```powershell
@@ -110,4 +144,4 @@ Run the automated pytest test suite:
 ```powershell
 python -m pytest tests/ -v
 ```
-All 12 unit and integration tests validate the Screen, Audio, Intelligence, and Windows Affinity modules.
+All 51 unit and integration tests validate the Screen, Audio, Intelligence, Overlay, and Windows Affinity modules.

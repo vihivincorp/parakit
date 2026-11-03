@@ -19,10 +19,10 @@ class AudioCapture:
         self,
         sample_rate: int = 16000,
         channels: int = 1,
-        chunk_duration_sec: float = 0.5,
+        chunk_duration_sec: float = 0.1,
         device_index: Optional[int] = None,
         use_wasapi_loopback: bool = True,
-        audio_source: str = "loopback"  # 'loopback' (meeting call focus), 'dual' (mic + call), 'mic' (mic only)
+        audio_source: str = "dual"  # 'dual' (mic + call), 'loopback' (meeting call focus), 'mic' (mic only)
     ):
         self.sample_rate = sample_rate
         self.channels = channels
@@ -35,6 +35,7 @@ class AudioCapture:
         self._mic_queue: queue.Queue = queue.Queue(maxsize=30)
         self._lb_queue: queue.Queue = queue.Queue(maxsize=30)
         self._mic_stream: Optional[sd.InputStream] = None
+        self._mic_rate: int = sample_rate
         self._pa = None
         self._lb_stream = None
         self._lb_rate = 48000
@@ -62,6 +63,15 @@ class AudioCapture:
         if not self._is_running:
             return
         data_copy = indata[:, 0].copy() if indata.ndim > 1 else indata.flatten().copy()
+
+        # Resample to target self.sample_rate if device required a different native sample rate
+        if self._mic_rate != self.sample_rate and len(data_copy) > 0:
+            target_len = int(round(len(data_copy) * (self.sample_rate / self._mic_rate)))
+            if target_len > 0:
+                orig_indices = np.linspace(0.0, 1.0, len(data_copy), endpoint=False)
+                target_indices = np.linspace(0.0, 1.0, target_len, endpoint=False)
+                data_copy = np.interp(target_indices, orig_indices, data_copy).astype(np.float32)
+
         if self.audio_source == "dual":
             self._enqueue_to_queue(self._mic_queue, data_copy)
         else:
@@ -82,7 +92,6 @@ class AudioCapture:
                 mono = raw
 
             # Clean linear interpolation resampling to exact sample_rate (e.g. 16000 Hz)
-            # Prevents pitch distortion (e.g., 44.1kHz -> 22.05kHz) and aliasing
             if self._lb_rate != self.sample_rate and len(mono) > 0:
                 target_len = int(round(len(mono) * (self.sample_rate / self._lb_rate)))
                 if target_len > 0:
@@ -170,19 +179,29 @@ class AudioCapture:
         # 2. Start Microphone Stream (dual, mic mode, or automatic fallback if loopback unavailable)
         need_mic = (self.audio_source in ("mic", "dual")) or (self.audio_source == "loopback" and not loopback_success)
         if need_mic:
-            try:
-                self._mic_stream = sd.InputStream(
-                    samplerate=self.sample_rate,
-                    channels=self.channels,
-                    dtype="float32",
-                    blocksize=self.chunk_samples,
-                    device=self.device_index,
-                    callback=self._mic_callback
-                )
-                self._mic_stream.start()
-                logger.info(f"Microphone capture active (Rate={self.sample_rate}Hz, Block={self.chunk_samples})")
-            except Exception as e:
-                logger.warning(f"Could not open microphone stream: {e}")
+            rates_to_try = [self.sample_rate, 48000, 44100]
+            opened = False
+            for rate in rates_to_try:
+                try:
+                    self._mic_rate = rate
+                    block = int(rate * (self.chunk_samples / self.sample_rate))
+                    self._mic_stream = sd.InputStream(
+                        samplerate=rate,
+                        channels=self.channels,
+                        dtype="float32",
+                        blocksize=block,
+                        device=self.device_index,
+                        callback=self._mic_callback
+                    )
+                    self._mic_stream.start()
+                    opened = True
+                    logger.info(f"Microphone capture active (Rate={rate}Hz, Target={self.sample_rate}Hz, Block={block})")
+                    break
+                except Exception as e:
+                    logger.debug(f"Could not open mic at {rate}Hz: {e}")
+
+            if not opened:
+                logger.warning("Could not open microphone stream on any sample rate.")
 
     def set_audio_source(self, source: str):
         """Switches active audio source dynamically ('loopback', 'dual', 'mic')."""
@@ -210,7 +229,7 @@ class AudioCapture:
             except queue.Empty:
                 pass
 
-            # Try to grab simultaneous loopback frame
+            # Try to grab simultaneous loopback frame without blocking
             try:
                 lb_data = self._lb_queue.get_nowait()
             except queue.Empty:
@@ -247,11 +266,15 @@ class AudioCapture:
 
             if mic_data is not None and lb_data is not None:
                 min_len = min(len(mic_data), len(lb_data))
-                mixed = np.clip(mic_data[:min_len] + lb_data[:min_len], -1.0, 1.0)
-                if mic_energy > lb_energy * 1.3 and mic_energy > 0.005:
-                    speaker = "Candidate"
-                else:
+                if lb_energy > 0.005 and mic_energy > 0.005:
+                    mixed = np.clip(mic_data[:min_len] + lb_data[:min_len], -1.0, 1.0)
+                    speaker = "Candidate" if mic_energy > lb_energy else "Interviewer"
+                elif lb_energy > 0.005:
+                    mixed = lb_data
                     speaker = "Interviewer"
+                else:
+                    mixed = mic_data
+                    speaker = "Candidate"
             elif mic_data is not None:
                 mixed = mic_data
                 speaker = "Candidate"

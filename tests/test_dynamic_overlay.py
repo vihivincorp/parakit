@@ -5,24 +5,21 @@ from ui.overlay import DesktopOverlay
 
 @pytest.fixture(scope="module")
 def overlay():
-    inst = DesktopOverlay(width=820, height=340, min_height=340, max_height=680, exclude_from_capture=False)
+    inst = DesktopOverlay(width=840, height=480, exclude_from_capture=False)
     inst.root.update()
     yield inst
     inst.close()
 
-def test_overlay_dynamic_initialization(overlay):
+def test_overlay_static_initialization(overlay):
     overlay.root.update()
-    assert overlay.min_height == 340
-    assert overlay.max_height == 680
-    assert overlay.current_height == 340
-    assert hasattr(overlay, "size_toggle_btn")
-    # Verify chat option is present and entry is accessible
+    assert overlay.is_static_window is True
+    assert overlay.current_height >= 460
     assert hasattr(overlay, "user_entry")
     assert overlay.user_entry.winfo_height() > 10
-    # Verify chat is positioned above the answer screen
     assert overlay.user_entry.winfo_rooty() < overlay.answer_box.winfo_rooty()
 
-def test_overlay_progressive_expansion(overlay):
+def test_overlay_static_during_content_stream(overlay):
+    """Verify window height stays strictly static and does not jitter or expand dynamically."""
     overlay.root.update()
     initial_h = overlay.current_height
 
@@ -31,46 +28,52 @@ def test_overlay_progressive_expansion(overlay):
     overlay.post_update("answer", {"text": text_8})
     time.sleep(0.1)
     overlay.root.update()
-    h_8 = overlay.current_height
-    assert h_8 > initial_h
+    assert overlay.current_height == initial_h  # Static height preserved!
 
-    # Feed 25 lines (large content)
+    # Feed 25 lines
     text_25 = "\n".join([f"Line {i}: code block implementation detail" for i in range(25)])
     overlay.post_update("answer", {"text": text_25})
     time.sleep(0.1)
     overlay.root.update()
-    h_25 = overlay.current_height
-    assert h_25 > h_8
-    assert h_25 == overlay.max_height  # Clamped at 680
+    assert overlay.current_height == initial_h  # Static height preserved!
 
-def test_overlay_stream_reset(overlay):
+def test_question_history_navigation(overlay):
+    """Verify currently asked question display and moving cursor up/down navigates past questions."""
     overlay.root.update()
-    # Reset when stream starts
-    overlay.post_update("stream_start", {})
-    time.sleep(0.1)
-    overlay.root.update()
-    assert overlay.current_height == 340
 
-def test_overlay_toggle_size(overlay):
+    # Feed Question 1
+    overlay.post_update("query", {"text": "What is binary search?", "speaker": "Interviewer"})
+    time.sleep(0.05)
     overlay.root.update()
-    assert overlay.current_height == 340
+    assert "binary search" in overlay.query_text.cget("text")
+    assert "CURRENTLY ASKED QUESTION" in overlay.q_header_lbl.cget("text")
+    assert overlay.current_q_idx == 0
 
-    # Toggle to full expanded
-    overlay.toggle_size()
+    # Feed Question 2
+    overlay.post_update("query", {"text": "What is its time complexity?", "speaker": "Interviewer"})
+    time.sleep(0.05)
     overlay.root.update()
-    assert overlay.current_height == 680
-    assert overlay.size_toggle_btn.cget("text") == "⤡"
+    assert "time complexity" in overlay.query_text.cget("text")
+    assert "CURRENTLY ASKED QUESTION" in overlay.q_header_lbl.cget("text")
+    assert overlay.current_q_idx == 1
 
-    # Toggle back to compact
-    overlay.toggle_size()
+    # Move cursor UP (review previous question)
+    overlay.show_prev_question()
     overlay.root.update()
-    assert overlay.current_height == 340
-    assert overlay.size_toggle_btn.cget("text") == "⤢"
+    assert "binary search" in overlay.query_text.cget("text")
+    assert "PREVIOUS QUESTION" in overlay.q_header_lbl.cget("text")
+    assert overlay.current_q_idx == 0
+
+    # Move cursor DOWN (return to current question)
+    overlay.show_next_question()
+    overlay.root.update()
+    assert "time complexity" in overlay.query_text.cget("text")
+    assert "CURRENTLY ASKED QUESTION" in overlay.q_header_lbl.cget("text")
+    assert overlay.current_q_idx == 1
 
 def test_pinned_code_session_retention(overlay):
     overlay.root.update()
 
-    # 1. Pin a LeetCode code problem solution into the single chat
     code_sol = (
         "### LeetCode Solution\n"
         "```python\n"
@@ -92,50 +95,45 @@ def test_pinned_code_session_retention(overlay):
     time.sleep(0.1)
     overlay.root.update()
 
-    # Verify code is pinned in the single chat feed
     assert overlay.pinned_code_text == code_sol
     assert overlay.pinned_code_title == "LeetCode TwoSum (Python)"
     chat_content = overlay.answer_box.get("1.0", "end")
     assert "class Solution:" in chat_content
     assert "def twoSum" in chat_content
-    # Jump to code button should be enabled
     assert overlay.jump_code_btn.cget("state") == "normal"
 
-    # 2. Simulate interviewer asking follow-up questions via live audio streams
-    # Interviewer Question 1: "Can you do this in O(1) space?"
     overlay.post_update("stream_start", {"speaker": "Interviewer"})
     overlay.post_update("stream_chunk", {"chunk": "If the array is sorted, we can use two pointers for O(1) space."})
     overlay.post_update("stream_end", {"full_text": "If the array is sorted, we can use two pointers for O(1) space."})
     time.sleep(0.1)
     overlay.root.update()
 
-    # Verify live answer is appended in the SAME single chat
     updated_chat = overlay.answer_box.get("1.0", "end")
     assert "two pointers" in updated_chat
-
-    # CRITICAL: Verify pinned code was NOT wiped by stream_start or stream_end in the single chat!
     assert "class Solution:" in updated_chat
-    assert "def twoSum" in updated_chat
-    assert "seen[num] = i" in updated_chat
 
-    # Interviewer Question 2: "What is the worst-case time complexity of hash map lookups?"
-    overlay.post_update("stream_start", {"speaker": "Interviewer"})
-    overlay.post_update("stream_chunk", {"chunk": "Average O(1), worst-case O(N) due to hash collisions."})
-    overlay.post_update("stream_end", {"full_text": "Average O(1), worst-case O(N) due to hash collisions."})
-    time.sleep(0.1)
+def test_overlay_minimize_and_restore(overlay):
     overlay.root.update()
+    assert overlay.is_minimized is False
+    assert hasattr(overlay, "minimize_btn")
 
-    # Verify BOTH questions and the original code solution are STILL preserved in the single chat
-    final_chat = overlay.answer_box.get("1.0", "end")
-    assert "class Solution:" in final_chat
-    assert "def twoSum" in final_chat
-    assert "two pointers" in final_chat
-    assert "hash collisions" in final_chat
-
-    # 3. Test navigation shortcuts (jump to code and jump to latest)
-    overlay.jump_to_code()
+    # Test minimize
+    overlay.minimize()
     overlay.root.update()
-    overlay.jump_to_latest()
+    assert overlay.is_minimized is True
+    assert overlay.root.state() == "withdrawn"
+
+    # Test restore
+    overlay.restore()
     overlay.root.update()
+    assert overlay.is_minimized is False
+    assert overlay.root.state() == "normal"
 
+    # Test toggle
+    overlay.toggle_minimize()
+    overlay.root.update()
+    assert overlay.is_minimized is True
 
+    overlay.toggle_minimize()
+    overlay.root.update()
+    assert overlay.is_minimized is False

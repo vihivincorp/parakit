@@ -32,9 +32,9 @@ class VoiceActivityDetector:
 
     def __init__(
         self,
-        energy_threshold: float = 0.010,
+        energy_threshold: float = 0.005,
         silence_timeout_sec: float = 0.80,
-        min_speech_duration_sec: float = 0.40,
+        min_speech_duration_sec: float = 0.35,
         pre_speech_chunks: int = 4
     ):
         self.energy_threshold = energy_threshold
@@ -49,7 +49,7 @@ class VoiceActivityDetector:
         self._speech_speakers: List[str] = []
         self._speech_start_time: float = 0.0
         self._last_speech_time: float = 0.0
-        self._noise_floor: float = 0.004
+        self._noise_floor: float = 0.0005
 
     @time_it("vad_processing")
     def process_chunk(self, chunk: AudioChunk) -> Optional[SpeechSegment]:
@@ -70,7 +70,7 @@ class VoiceActivityDetector:
 
         # Adaptive noise floor tracking during silence
         if not self._in_speech and rms < self.energy_threshold:
-            self._noise_floor = 0.96 * self._noise_floor + 0.04 * rms
+            self._noise_floor = 0.95 * self._noise_floor + 0.05 * rms
 
         dynamic_threshold = max(self.energy_threshold, self._noise_floor * 1.8)
         is_speech = rms >= dynamic_threshold
@@ -100,42 +100,37 @@ class VoiceActivityDetector:
                 self._in_speech = False
                 total_duration = current_time - self._speech_start_time
 
-                if total_duration >= self.min_speech_duration_sec and self._speech_buffer:
-                    concatenated_audio = np.concatenate(self._speech_buffer)
-                    # Determine dominant speaker during this utterance
-                    dominant_speaker = "Interviewer"
-                    if self._speech_speakers:
-                        candidate_count = self._speech_speakers.count("Candidate")
-                        interviewer_count = self._speech_speakers.count("Interviewer")
-                        dominant_speaker = "Candidate" if candidate_count > interviewer_count else "Interviewer"
+                if total_duration >= self.min_speech_duration_sec:
+                    combined_audio = np.concatenate(self._speech_buffer)
+                    # Majority vote on speaker attribution across voiced frames
+                    interviewer_count = sum(1 for s in self._speech_speakers if s == "Interviewer")
+                    candidate_count = len(self._speech_speakers) - interviewer_count
+                    dominant_speaker = "Interviewer" if interviewer_count >= candidate_count else "Candidate"
 
                     segment = SpeechSegment(
-                        audio=concatenated_audio,
+                        audio=combined_audio,
                         start_time=self._speech_start_time,
-                        end_time=self._last_speech_time,
-                        duration_sec=round(total_duration, 2),
+                        end_time=current_time,
+                        duration_sec=total_duration,
                         speaker=dominant_speaker
                     )
-                    self._speech_buffer = []
-                    self._speech_speakers = []
-                    self._pre_buffer.clear()
+                    self._speech_buffer.clear()
+                    self._speech_speakers.clear()
                     return segment
                 else:
-                    # Too short, likely click or noise
-                    self._speech_buffer = []
-                    self._speech_speakers = []
-                    self._pre_buffer.clear()
+                    self._speech_buffer.clear()
+                    self._speech_speakers.clear()
                     return None
-        else:
-            # Pure silence - maintain pre-speech rolling buffer
-            self._pre_buffer.append(audio_data)
+            return None
 
-        return None
+        else:
+            # Silent frame, retain in rolling pre-speech buffer
+            self._pre_buffer.append(audio_data)
+            return None
 
     def reset(self):
+        """Resets detector state."""
         self._in_speech = False
-        self._speech_buffer = []
-        self._speech_speakers = []
+        self._speech_buffer.clear()
+        self._speech_speakers.clear()
         self._pre_buffer.clear()
-        self._speech_start_time = 0.0
-        self._last_speech_time = 0.0

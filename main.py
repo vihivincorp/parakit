@@ -5,6 +5,29 @@ and runs the Tkinter desktop overlay on the main thread.
 """
 
 import sys
+import os
+
+# Ensure process attaches to physical interactive Default desktop before importing Tkinter
+if sys.platform == "win32":
+    try:
+        import ctypes
+        h_default = ctypes.windll.user32.OpenDesktopW("Default", 0, False, 0x01FF)
+        if h_default:
+            ctypes.windll.user32.SetThreadDesktop(h_default)
+    except Exception:
+        pass
+
+if hasattr(sys.stdout, "reconfigure") and sys.stdout:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure") and sys.stderr:
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import time
 import threading
 import argparse
@@ -21,7 +44,7 @@ from screen.preprocess import ImagePreprocessor
 from screen.ocr import ScreenOCR
 from screen.language_detector import LanguageDetector
 from intelligence.context_manager import MultimodalContextManager
-from intelligence.question_detector import QuestionDetector
+from intelligence.question_detector import QuestionDetector, IntentCategory
 from intelligence.llm_client import LLMClient
 from intelligence.response_manager import ResponseManager
 from intelligence.resume_manager import ResumeManager
@@ -45,7 +68,9 @@ class MultimodalAssistantApp:
             task=self.cfg.audio.stt_task,
             language=self.cfg.audio.stt_language,
             beam_size=self.cfg.audio.stt_beam_size,
-            initial_prompt=self.cfg.audio.initial_prompt
+            initial_prompt=self.cfg.audio.initial_prompt,
+            gnani_api_key=getattr(self.cfg.audio, "gnani_api_key", ""),
+            gnani_language_code=getattr(self.cfg.audio, "gnani_language_code", "en-IN")
         )
         self.audio_capture = AudioCapture(
             sample_rate=self.cfg.audio.sample_rate,
@@ -71,13 +96,18 @@ class MultimodalAssistantApp:
             tesseract_cmd=self.cfg.screen.tesseract_cmd,
             similarity_threshold=self.cfg.screen.similarity_threshold
         )
+        logger.info("ScreenOCR ready.")
 
         self.context_mgr = MultimodalContextManager(
             speech_window_sec=self.cfg.context.speech_window_sec,
             max_history_turns=self.cfg.context.max_history_turns,
             max_screen_chars=self.cfg.context.max_screen_chars
         )
+        logger.info("ContextManager ready.")
+
         self.question_detector = QuestionDetector()
+        logger.info("QuestionDetector ready.")
+
         self.llm_client = LLMClient(
             api_key=self.cfg.llm.api_key,
             provider=self.cfg.llm.provider,
@@ -86,9 +116,13 @@ class MultimodalAssistantApp:
             temperature=self.cfg.llm.temperature,
             mock_mode=self.cfg.llm.mock_mode
         )
+        logger.info("LLMClient ready.")
+
         self.response_mgr = ResponseManager()
+        logger.info("ResponseManager ready.")
 
         # UI Overlay (runs on main thread)
+        logger.info("Initializing DesktopOverlay...")
         self.overlay = DesktopOverlay(
             width=self.cfg.ui.width,
             height=self.cfg.ui.height,
@@ -97,6 +131,7 @@ class MultimodalAssistantApp:
             opacity=self.cfg.ui.opacity,
             exclude_from_capture=self.cfg.ui.exclude_from_capture
         )
+        logger.info("DesktopOverlay ready.")
         self.overlay.on_toggle_pause = self._on_ui_toggle_pause
         self.overlay.on_audio_source_change = self._on_ui_audio_source_change
         self.overlay.on_manual_query = lambda q: threading.Thread(target=self._handle_manual_query, args=(q,), daemon=True).start()
@@ -105,9 +140,19 @@ class MultimodalAssistantApp:
 
         # Sync UI audio mode button with configured source
         self.overlay.set_audio_mode(self.cfg.audio.audio_source)
+        logger.info(f"UI Audio mode synced to {self.cfg.audio.audio_source}.")
+
+        # Global Hotkey Listener (Alt+M to minimize / restore)
+        from windows.global_hotkey import GlobalHotkeyListener
+        self.hotkey_listener = GlobalHotkeyListener(
+            key="m",
+            modifiers=("alt",),
+            callback=self._on_global_hotkey
+        )
 
         # 3. Initialize Resume Manager & load cached resume if present
         self.resume_mgr = ResumeManager()
+        logger.info("ResumeManager ready.")
         if self.resume_mgr.get_resume_text():
             self.context_mgr.set_resume(self.resume_mgr.get_resume_text(), self.resume_mgr.get_resume_filename())
             self.overlay.set_resume_badge(self.resume_mgr.get_resume_filename())
@@ -117,13 +162,18 @@ class MultimodalAssistantApp:
         self._screen_thread: Optional[threading.Thread] = None
         self._audio_thread: Optional[threading.Thread] = None
 
+    def _on_global_hotkey(self):
+        """Global Alt+M shortcut callback: toggles overlay visibility."""
+        if hasattr(self, "overlay") and self.overlay:
+            self.overlay.post_update("toggle_visibility", {})
+
     def _sync_resume_vocabulary(self, resume_text: str):
         """Extracts technical terms and project names from resume to bias Whisper STT vocabulary."""
         if not resume_text or not hasattr(self, "stt"):
             return
         import re
         tokens = re.findall(r'[A-Za-z0-9+#.-]{3,}', resume_text)
-        candidates = set(["HireMatrix", "Neo4j", "FastAPI", "GitProof", "TextMorph", "LeetCode", "PyTorch", "MongoDB"])
+        candidates = set(["HireMatrix", "Neo4j", "FastAPI", "GitProof", "TextMorph", "PyTorch", "MongoDB"])
         for t in tokens:
             if t[0].isupper() or any(c in t for c in "+#.") or t.isupper():
                 if len(t) <= 25 and t.lower() not in ("the", "and", "for", "with", "from", "using", "built", "developed"):
@@ -381,7 +431,8 @@ class MultimodalAssistantApp:
             logger.info(f"Intent classified: {intent.category.value} (Trigger LLM: {intent.trigger_llm})")
 
             if not intent.trigger_llm:
-                self.overlay.post_update("query", {"text": f"Heard: \"{intent.text}\"", "speaker": speaker})
+                if intent.category != IntentCategory.IRRELEVANT:
+                    self.overlay.post_update("query", {"text": f"Heard: \"{intent.text}\"", "speaker": speaker})
                 self.overlay.post_update("status", {"status": "LISTENING", "color": "#10B981"})
                 return
 
@@ -398,9 +449,22 @@ class MultimodalAssistantApp:
 
             self.overlay.post_update("detected_language", {"lang": target_lang})
 
-            # 4. Formulate multimodal context (only include screen if explicitly asked)
+            # 4. Formulate multimodal context (include screen if relevant)
             lower_intent = intent.text.lower()
-            speech_needs_screen = any(w in lower_intent for w in ("screen", "look here", "this problem", "this error", "on my display", "solve this", "code here"))
+            speech_needs_screen = any(w in lower_intent for w in (
+                "screen", "look", "problem", "error", "display", "solve", "code",
+                "this", "option", "mcq", "question", "answer", "which", "here", "why", "check"
+            ))
+            if speech_needs_screen:
+                try:
+                    raw_frame = self.screen_capture.capture_frame(crop_box=self.cfg.screen.crop_region)
+                    processed_frame = self.image_preprocessor.preprocess(raw_frame)
+                    ocr_res = self.ocr_engine.extract_text(processed_frame)
+                    if ocr_res.text:
+                        self.context_mgr.update_screen(ocr_res.text)
+                except Exception as e_scr:
+                    logger.debug(f"Quick screen capture on speech query failed: {e_scr}")
+
             prompt_payload = self.context_mgr.format_context_for_llm(intent.text, include_screen=speech_needs_screen)
 
             # 5. Stream LLM tokens in real-time
@@ -484,7 +548,30 @@ class MultimodalAssistantApp:
 
     def start(self):
         """Starts worker threads and blocks on the main UI loop."""
+        import os
+        pid_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assistant.pid")
+        if os.path.exists(pid_file):
+            try:
+                with open(pid_file, "r", encoding="utf-8") as f:
+                    old_pid = int(f.read().strip())
+                if old_pid != os.getpid() and is_pid_running(old_pid):
+                    logger.info(f"Multimodal Assistant already running (PID: {old_pid}). Focusing existing instance.")
+                    return
+            except Exception:
+                pass
+
         self.is_running = True
+
+        # Save PID file for detached process tracking
+        try:
+            with open(pid_file, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+        except Exception:
+            pass
+
+        # Start global hotkey listener (Alt+M to minimize / restore)
+        if hasattr(self, "hotkey_listener") and self.hotkey_listener:
+            self.hotkey_listener.start()
 
         self._screen_thread = threading.Thread(target=self._screen_worker, daemon=True)
         self._screen_thread.start()
@@ -492,7 +579,7 @@ class MultimodalAssistantApp:
         self._audio_thread = threading.Thread(target=self._audio_worker, daemon=True)
         self._audio_thread.start()
 
-        logger.info("Multimodal Desktop Assistant running. Press Ctrl+C in console or [X] on overlay to exit.")
+        logger.info(f"Multimodal Desktop Assistant running (PID: {os.getpid()}). Excluded from capture.")
         try:
             self.overlay.run()
         finally:
@@ -504,6 +591,23 @@ class MultimodalAssistantApp:
             return
         logger.info("Shutting down assistant...")
         self.is_running = False
+
+        # Stop global hotkey listener
+        if hasattr(self, "hotkey_listener") and self.hotkey_listener:
+            try:
+                self.hotkey_listener.stop()
+            except Exception:
+                pass
+
+        # Remove PID file
+        try:
+            import os
+            pid_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assistant.pid")
+            if os.path.exists(pid_file):
+                os.remove(pid_file)
+        except Exception:
+            pass
+
         self.audio_capture.stop()
         self.screen_capture.close()
         self.overlay.close()
@@ -511,14 +615,235 @@ class MultimodalAssistantApp:
         logger.info("Shutdown complete.")
 
 
+PID_FILE_NAME = "assistant.pid"
+
+def get_pid_file_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), PID_FILE_NAME)
+
+def is_pid_running(pid: int) -> bool:
+    """Checks if a given process ID is active and running."""
+    if pid <= 0:
+        return False
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    from ctypes import wintypes
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    h_proc = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if h_proc:
+        code = wintypes.DWORD()
+        ctypes.windll.kernel32.GetExitCodeProcess(h_proc, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(h_proc)
+        return code.value == 259  # STILL_ACTIVE
+    return False
+
+def get_running_pid() -> Optional[int]:
+    """Returns the PID of the active background assistant, or None."""
+    pid_file = get_pid_file_path()
+    if os.path.exists(pid_file):
+        try:
+            with open(pid_file, "r", encoding="utf-8") as f:
+                pid = int(f.read().strip())
+            if is_pid_running(pid):
+                return pid
+            else:
+                # Remove stale PID file
+                os.remove(pid_file)
+        except Exception:
+            pass
+    return None
+
+def find_pythonw_executable() -> str:
+    """Finds pythonw.exe on Windows for detached console-free execution."""
+    import shutil
+    candidates = [
+        shutil.which("pythonw"),
+        os.path.join(os.path.dirname(sys.executable), "pythonw.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\pythonw.exe")
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    return sys.executable
+
+def start_background_assistant(extra_args: list = None) -> int:
+    """Launches the assistant as a fully detached background process and returns its PID."""
+    running_pid = get_running_pid()
+    if running_pid:
+        print("\n" + "=" * 68)
+        print(f"● [ALREADY RUNNING] Multimodal AI Assistant is active (PID: {running_pid})")
+        print("=" * 68)
+        print("  • Hotkey  : Press Alt + M to minimize / restore the overlay")
+        print("  • Status  : python main.py status   (or .\\status.bat)")
+        print("  • Stop    : python main.py stop     (or .\\stop.bat)")
+        print("=" * 68 + "\n")
+        return running_pid
+
+    from windows import ensure_interactive_desktop
+    ensure_interactive_desktop()
+
+    pythonw = find_pythonw_executable()
+    this_script = os.path.abspath(__file__)
+    workspace_dir = os.path.dirname(this_script)
+
+    cmd = [pythonw, this_script, "run"]
+    if extra_args:
+        cmd.extend(extra_args)
+
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    flags = CREATE_NEW_PROCESS_GROUP
+    # Only add CREATE_NO_WINDOW if falling back to python.exe (pythonw already has no console)
+    if not os.path.basename(pythonw).lower().startswith("pythonw"):
+        flags |= 0x08000000  # CREATE_NO_WINDOW
+
+    import subprocess
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.lpDesktop = r"WinSta0\Default"
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=workspace_dir,
+        startupinfo=startupinfo,
+        creationflags=flags,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True
+    )
+
+    # Wait up to 3 seconds for PID file verification
+    pid = proc.pid
+    pid_file = get_pid_file_path()
+    for _ in range(15):
+        time.sleep(0.2)
+        if os.path.exists(pid_file):
+            try:
+                with open(pid_file, "r", encoding="utf-8") as f:
+                    pid = int(f.read().strip())
+                break
+            except Exception:
+                pass
+
+    print("\n" + "=" * 68)
+    print("⚡ MULTIMODAL REAL-TIME AI DESKTOP ASSISTANT")
+    print("=" * 68)
+    print(f"  [✓] Started in background successfully! (PID: {pid})")
+    print("  [✓] Fully detached: safe to CLOSE this terminal window anytime!")
+    print()
+    print("KEYBOARD SHORTCUT:")
+    print("  • Alt + M              : Minimize or Restore overlay anytime from anywhere")
+    print()
+    print("TERMINAL CONTROL COMMANDS:")
+    print("  • python main.py status : Check assistant status and running PID")
+    print("  • python main.py stop   : Stop the background assistant")
+    print("  • python main.py restart: Restart the assistant")
+    print("=" * 68 + "\n")
+    return pid
+
+def stop_background_assistant() -> bool:
+    """Terminates the running assistant background instance cleanly."""
+    import subprocess
+    running_pid = get_running_pid()
+    pid_file = get_pid_file_path()
+
+    stopped = False
+    if running_pid:
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(running_pid)], capture_output=True)
+            stopped = True
+        except Exception:
+            pass
+
+    # Clean up pid file
+    if os.path.exists(pid_file):
+        try:
+            os.remove(pid_file)
+        except Exception:
+            pass
+
+    # Clean up any lingering pythonw processes running the assistant
+    try:
+        subprocess.run(["taskkill", "/F", "/IM", "pythonw.exe"], capture_output=True)
+        subprocess.run(["taskkill", "/F", "/IM", "pythonw3.11.exe"], capture_output=True)
+    except Exception:
+        pass
+
+    print("\n" + "=" * 68)
+    if stopped:
+        print(f"  [✓] Multimodal AI Desktop Assistant (PID: {running_pid}) has been STOPPED.")
+    else:
+        print("  [INFO] Multimodal AI Desktop Assistant is not currently running.")
+    print("=" * 68 + "\n")
+    return stopped
+
+def show_assistant_status():
+    """Displays running status and management commands."""
+    running_pid = get_running_pid()
+    print("\n" + "=" * 68)
+    if running_pid:
+        print(f"● [RUNNING] Multimodal AI Desktop Assistant is ACTIVE (PID: {running_pid})")
+        print("=" * 68)
+        print("  • Mode     : Background Detached (safe to close terminal/IDE)")
+        print("  • Shortcut : Alt + M (Minimize / Restore overlay)")
+        print("  • Stop     : python main.py stop (or .\\stop.bat)")
+        print("  • Restart  : python main.py restart (or .\\restart.bat)")
+    else:
+        print("○ [STOPPED] Multimodal AI Desktop Assistant is not running.")
+        print("=" * 68)
+        print("  • Start    : python main.py start (or .\\start.bat)")
+    print("=" * 68 + "\n")
+
 def main():
+    from windows import ensure_interactive_desktop
+    ensure_interactive_desktop()
+
     parser = argparse.ArgumentParser(description="Multimodal Real-Time AI Desktop Assistant")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default=None,
+        choices=["start", "stop", "status", "restart", "run"],
+        help="Command to execute: start, stop, status, restart, run"
+    )
     parser.add_argument("--dry-run", action="store_true", help="Initialize and verify pipelines then exit")
     parser.add_argument("--simulate", action="store_true", help="Run simulated query test on startup")
     parser.add_argument("--monitor", type=int, default=1, help="Monitor index to capture")
     parser.add_argument("--mic", type=int, default=None, help="Audio input device index")
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
 
+    # Route CLI commands
+    cmd = args.command
+    if cmd == "stop":
+        stop_background_assistant()
+        return
+
+    if cmd == "status":
+        show_assistant_status()
+        return
+
+    if cmd == "restart":
+        stop_background_assistant()
+        time.sleep(1.0)
+        start_background_assistant()
+        return
+
+    if cmd == "start":
+        start_background_assistant()
+        return
+
+    # If no explicit command is provided:
+    # If run from interactive console python.exe and not dry-run/simulate:
+    # default to starting detached in the background so closing the terminal never kills it!
+    is_pythonw = os.path.basename(sys.executable).lower().startswith("pythonw")
+    if cmd is None and not args.dry_run and not args.simulate and not is_pythonw:
+        start_background_assistant()
+        return
+
+    # Otherwise execute in foreground (e.g. "run", "--dry-run", "--simulate", or called by pythonw)
     cfg.screen.monitor_index = args.monitor
     cfg.audio.device_index = args.mic
 
@@ -535,7 +860,6 @@ def main():
         return
 
     if args.simulate:
-        # Schedule simulation 2 seconds after UI start
         threading.Timer(
             2.0,
             lambda: app.simulate_event(

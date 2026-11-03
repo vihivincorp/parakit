@@ -58,6 +58,14 @@ class QuestionDetector:
                 text=clean
             )
 
+        # 1b. Check for web URLs, domain names, or leetcode.com hallucination artifacts
+        if "leetcode.com" in lower or (len(words) <= 3 and any(w in ("www", "http", "https", "com", "org", "net") for w in words)):
+            return DetectedIntent(
+                category=IntentCategory.IRRELEVANT,
+                confidence=0.98,
+                trigger_llm=False,
+                text=clean
+            )
         # 2. Check for explicit question mark
         if "?" in clean:
             return DetectedIntent(
@@ -87,7 +95,7 @@ class QuestionDetector:
             )
 
         # 5. Technical keywords indicator (interview / coding / meeting)
-        tech_indicators = {"difference", "complexity", "algorithm", "approach", "solution", "leetcode", "runtime", "memory", "function"}
+        tech_indicators = {"difference", "complexity", "algorithm", "approach", "solution", "runtime", "memory", "function", "optimize"}
         if any(w in words for w in tech_indicators):
             return DetectedIntent(
                 category=IntentCategory.QUESTION,
