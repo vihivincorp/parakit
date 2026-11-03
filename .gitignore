@@ -4,6 +4,7 @@
 *.env
 api_keys.json
 *.pid
+.resume_cache.json
 
 # Python caches
 __pycache__/
